@@ -29,15 +29,11 @@
         private void InitializeComponent()
         {
             this.SuspendLayout();
-            // 
+            //
             // Color8KeySlider
-            // 
+            //
             this.Size = new System.Drawing.Size(396, 42);
-            this.Click += new System.EventHandler(this.Color8KeySlider_Click);
-            this.MouseDown += new System.Windows.Forms.MouseEventHandler(this.Color8KeySlider_MouseDown);
-            this.MouseHover += new System.EventHandler(this.Color8KeySlider_MouseHover);
-            this.MouseMove += new System.Windows.Forms.MouseEventHandler(this.Color8KeySlider_MouseMove);
-            this.MouseUp += new System.Windows.Forms.MouseEventHandler(this.Color8KeySlider_MouseUp);
+            // Event handlers are wired in the constructor (avoids the old double-wiring of the mouse events).
             this.ResumeLayout(false);
 
         }

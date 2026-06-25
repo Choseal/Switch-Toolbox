@@ -538,7 +538,7 @@
             // MainForm
             // 
             this.AllowDrop = true;
-            this.ClientSize = new System.Drawing.Size(1108, 621);
+            this.ClientSize = new System.Drawing.Size(1158, 621);
             this.Controls.Add(this.tabForms);
             this.Controls.Add(this.stPanel2);
             this.Controls.Add(this.stPanel1);

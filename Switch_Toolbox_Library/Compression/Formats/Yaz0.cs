@@ -32,6 +32,9 @@ namespace Toolbox.Library
         {
             var comp = stream.ToBytes();
             UInt32 decompressedSize = (uint)(comp[4] << 24 | comp[5] << 16 | comp[6] << 8 | comp[7]);
+            //Preserve the alignment hint stored in the Yaz0 header (offset 8, big endian) so it can be
+            //written back on save. Without this it defaults to 0 and a re-saved file loses its alignment.
+            Alignment = (comp[8] << 24 | comp[9] << 16 | comp[10] << 8 | comp[11]);
             var data = Decompress(comp);
            // var data = EveryFileExplorer.YAZ0.Decompress(comp);
           //  System.IO.File.WriteAllBytes("testYaz0.dec", data);

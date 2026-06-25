@@ -232,6 +232,10 @@ namespace Toolbox.Library.IO
              bool Compressed = false, ICompressionFormat FileCompression = null)
         {
             fileFormat.IFileInfo.FileCompression = FileCompression;
+            //Carry the alignment captured during Yaz0 decompression into the file info so it is
+            //re-applied when the file is compressed again on save (was previously lost / defaulted to 0).
+            if (FileCompression is Yaz0)
+                fileFormat.IFileInfo.Alignment = ((Yaz0)FileCompression).Alignment;
             fileFormat.IFileInfo.FileIsCompressed = Compressed;
             fileFormat.FileName = Path.GetFileName(FileName);
             fileFormat.FilePath = FileName;

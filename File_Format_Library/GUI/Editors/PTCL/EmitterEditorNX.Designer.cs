@@ -134,7 +134,7 @@
             // 
             this.emitterTexturePanel1.Location = new System.Drawing.Point(6, 290);
             this.emitterTexturePanel1.Name = "emitterTexturePanel1";
-            this.emitterTexturePanel1.Size = new System.Drawing.Size(255, 112);
+            this.emitterTexturePanel1.Size = new System.Drawing.Size(255, 124);
             this.emitterTexturePanel1.TabIndex = 46;
             // 
             // pictureBox4
@@ -162,7 +162,9 @@
             this.colorSelector1.DisplayColor = true;
             this.colorSelector1.Location = new System.Drawing.Point(316, 44);
             this.colorSelector1.Name = "colorSelector1";
-            this.colorSelector1.Size = new System.Drawing.Size(233, 188);
+            // 246 wide so the alpha bar (a child panel fixed at x=219, width 24) is fully visible; at the old
+            // 233 it was clipped to ~14px, making alpha tracks look like the picker was disabled.
+            this.colorSelector1.Size = new System.Drawing.Size(246, 188);
             this.colorSelector1.TabIndex = 44;
             this.colorSelector1.ColorChanged += new System.EventHandler(this.colorSelector1_ColorChanged);
             // 

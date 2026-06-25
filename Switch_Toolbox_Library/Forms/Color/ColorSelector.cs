@@ -90,7 +90,7 @@ namespace Toolbox.Library.Forms
             set
             {
                 displayAlpha = value;
-                alphaPanel.Visible = displayAlpha;
+                RefreshPanelLayout();
             }
         }
 
@@ -101,7 +101,28 @@ namespace Toolbox.Library.Forms
             set
             {
                 displayColor = value;
-                huePanel.Enabled = displayColor;
+                RefreshPanelLayout();
+            }
+        }
+
+        //Show only the controls that apply. Colour off (alpha-only editing) = HIDE the hue bar + colour square
+        //(they don't apply to a single opacity value) and grow the alpha bar to fill the picker, giving one clear
+        //control. With both on (the colour dialogs) this is the original full square + hue + alpha layout.
+        private void RefreshPanelLayout()
+        {
+            colorSquare.Visible = displayColor;
+            huePanel.Visible = displayColor;
+            huePanel.Enabled = displayColor;
+            alphaPanel.Visible = displayAlpha;
+            if (!displayColor && displayAlpha)
+            {
+                alphaPanel.Location = new System.Drawing.Point(colorSquare.Left, colorSquare.Top);
+                alphaPanel.Width = Math.Max(24, this.Width - 2 * colorSquare.Left);
+            }
+            else
+            {
+                alphaPanel.Location = new System.Drawing.Point(219, 3);
+                alphaPanel.Width = 24;
             }
         }
 
@@ -224,6 +245,12 @@ namespace Toolbox.Library.Forms
                     hueY = y;
 
                     _hsv.H = (ushort)((float)y / (huePanel.Height - 1) * 360);
+
+                    //Hue alone has NO effect on a fully grey/black colour (S=0 or V=0) - so dragging the hue bar on
+                    //a white key looked like it "did nothing" until the square set saturation/value. Give it a
+                    //sensible saturation/value so the hue bar always changes the colour.
+                    if (_hsv.S == 0) _hsv.S = 100;
+                    if (_hsv.V == 0) _hsv.V = 100;
 
                     OnColorChanged(true);
                 }

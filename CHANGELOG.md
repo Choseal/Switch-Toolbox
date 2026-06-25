@@ -1,0 +1,190 @@
+# BotW EFT Renderer Changelog
+
+## v5: Editing polish and preview fixes (2026-06-25)
+
+Usability fixes from hands-on testing.
+
+### Editing
+- **Delete warnings name the references**: deleting a texture or primitive now lists up to 5 "Set / Emitter"
+  names of the emitters that use it (plus the total), so they are easy to find, instead of only a count.
+- **Import an .obj into an empty primitive table**: when a file's PRMA has no primitive to use as a header
+  template, the importer borrows one from any other open file. An .obj carries only geometry, so a PRIM
+  header template is still required; this removes the dead end as long as another effect file is open.
+- **Delete the last texture**: now allowed. An empty texture table is valid, and Add Texture can create a
+  new texture from scratch, so blocking the final delete served no purpose.
+- **Primitive context menu**: dropped the inherited generic STGenericWrapper items (Export / Replace /
+  Rename / Delete), which do nothing useful on a raw PRIM mesh block: Export opened a save dialog but
+  wrote no file (the base Export() is an empty stub that was never overridden), Replace and Delete were
+  greyed out (CanReplace / CanDelete are false), and Rename only relabeled the tree node. The
+  purpose-built "Export mesh (.obj)" / "Replace mesh (.obj)" / "Delete Primitive" items remain.
+
+## v4: Review hardening (2026-06-25)
+
+A maintainer-style pass over the whole diff against stock Switch-Toolbox: real-bug fixes, defensive
+hardening, and comment/encoding cleanup so the change reads as a presentable pull request. No feature
+changes; build stays green.
+
+### Fixes
+- **Cross-file resource pool leak**: the per-file texture/primitive lists were appended on every reparse
+  and never cleared, growing unbounded and holding stale objects after each structural edit. Now cleared
+  before each republish.
+- **Malformed PRIM no longer aborts the file open**: the mesh decoder clamps its vertex count to what the
+  block can hold, so a truncated/corrupt primitive yields a partial mesh instead of throwing.
+
+### Cleanup
+- Moved the renderer to `GL/` alongside the other GL renderers; split the EFTB section/resource types
+  (section-tree editing node, textures, PRIM mesh) into a `PCTL.Eftb.cs` partial class so the shared
+  parser file drops from ~4900 to ~3500 lines.
+
+### Cross-format safety / licensing
+- The Parameters tab + live preview + mesh column are now built lazily on the first EFTB emitter, so the
+  3DS / Switch PTCL editor keeps its stock layout instead of gaining an inert tab and preview pane.
+- Published `gx2dec_src/` (the CLI driver + build script + README) and an MPL-2.0 NOTICE next to the
+  bundled `gx2dec.exe`; it links Cemu's MPL-2.0 Latte decompiler (commit 079a4af), so the source is
+  available per the license. The NOTICE is copied alongside the binary on build.
+
+## v3: Shader integration: visibility + CRUD + cross-file (2026-06-25)
+
+The toolbox decompiles GX2 -> GLSL for viewing but has no compiler, so shaders can be viewed, re-pointed,
+deleted, copied and moved between files, but never authored from scratch (every "create" is a copy of an
+existing compiled shader).
+
+### New features
+- **Shader usage view**: the "GTX Shader" node lists each shader program in use and which emitters bind
+  it, with the fragment sampler count and a "[shared with <other open file>]" tag (byte-identical GX2
+  program shared with another loaded `.sesetlist`), making the shader<->emitter<->file links explicit.
+- **Re-point an emitter's shader**: the emitter Parameters tab ("1c. Shader") picks the vertex / fragment
+  shader index (dropdown of the file's pool) the emitter binds; bakes on save.
+- **Prune Unused Shaders / Clear All Shaders**: right-click the GTX Shader node. Prune drops every shader
+  no emitter references (re-indexing the survivors); Clear blanks the whole bundle (guarded, irreversible).
+  Useful because deleting emitter sets does not by itself remove the shaders they used.
+- **Shaders travel with export/import**: EFTX bundles (v2) now carry the referenced GX2 shader groups;
+  importing an emitter/set merges them into the target bundle (dedup by content) and re-points the imported
+  emitter onto them, so a moved emitter actually renders in the target file.
+
+## v2: Editing, import/export, shader view & stability (2026-06-25)
+
+Builds on the v1 renderer below. Adds file-editing and shader-inspection tooling and hardens the
+emitter-editing pipeline.
+
+### New features
+
+- **Clear folder contents**: right-click "Clear All" on the Emitter Sets, Textures, or PRMA roots to
+  empty them while keeping the (now-empty) root. Clearing textures/primitives warns how many emitters
+  still reference them, listing up to 5 example emitter names.
+- **Export / import emitters and sets**: right-click to export an emitter (`.eftemitter`) or a whole
+  set (`.eftset`) to a toolbox-only bundle, and import it into another `.sesetlist`. The bundle copies
+  the referenced textures/primitives that exist in any open file (so it's self-contained); a reference
+  to a resource in an unopened file is exported as a plain reference and resolves against the target.
+  Imported resources dedupe by texture id / primitive hash (no duplicates, no remap).
+- **View an emitter's GX2 shader as GLSL**: right-click an emitter -> "View Shader (GLSL)" decompiles
+  the vertex + fragment shaders it binds out of the SHDA bundle (via a CEMU-derived GX2 / Wii U Latte ->
+  GLSL decompiler) and reports which shader indices it uses plus the texture/uniform binding map.
+
+### Fixes & stability
+
+- **Preview leak crash**: fixed a GPU-resource leak that crashed the toolbox after previewing several
+  emitters; shaders/VBO/scene texture are now shared per GL control and per-emitter mesh buffers are
+  freed when a render is swapped out.
+- **Hidden save dialogs**: the "Compress with Yaz0?" prompt and the "saved" notice are now owned by the
+  main window so they no longer render behind it; the live preview pauses while the app isn't foreground.
+- **File Explorer blanking on delete**: deleting an emitter no longer blanks/freezes the tree (the
+  texture-id mapping was O(n^2)); after an add/delete the tree keeps the root folders expanded and
+  selects the neighbor (previous entry, else the parent folder).
+
+---
+
+## v1: Renderer (initial features)
+
+- **Live 3D preview of BotW particle effects** inside Switch-Toolbox, select any emitter in a
+  `.sesetlist` and it renders, driven entirely from the file's own bytes.
+- **Billboard particles**: camera-facing textured quads, world-space sizing, particle spin.
+- **Mesh / primitive particles**: PRIM geometry for ring / shockwave / ripple emitters.
+- **Stripe & ribbon types**: connection stripes (threaded through live particles) and trail stripes
+  (per-particle position history), rendered as tapered camera-facing ribbons.
+- **CPU motion simulation** from decoded fields: lifespan, emit rate / interval, two-stage emission
+  velocity, dispersion cone, air resistance, volume shapes, momentum randomization.
+- **Color / alpha / scale over life**: driven by the 8-key animation curves.
+- **3-texture combiner**: each emitter composites up to 3 texture slots with its own per-slot blend
+  ops (multiply / add / subtract / max).
+- **Faithful render state**: additive vs alpha blend, depth test, face culling, and a universal alpha
+  test
+- **Emission classes**: continuous / one-shot burst / windowed, with a one-shot replay pause so
+  explosions fire-and-pause instead of streaming forever; ambient effects (rain, torches) keep flowing.
+- **Automatic camera framing**: to the effect's extent, with relative particle sizes preserved.
+- **Distortion / refraction pass**: `_ind` / Haze / ripple emitters warp the rendered scene buffer.
+- **Per-axis texture wrap + quadrant mirror-tiling**: e.g. the Guardian targeting reticle ring is
+  stored as one quarter and mirror-tiled into the full ring.
+- **Per-slot flipbook atlases**: each texture slot samples its own grid cell, on both the mesh and
+  billboard paths.
+- **Static flipbook cell selection**: variant-picker emitters (e.g. the 12 field flowers) each hold
+  their own assigned atlas cell instead of cycling.
+- **BC5 normal/flow-map detection**: keeps data textures out of the alpha coverage mask so they don't
+  draw as opaque rectangles.
+- **Cursor-follow emitter**: moving the mouse over the preview drives stripe/trail emitters so ribbons
+  sweep (supplying the emitter motion the `.sesetlist` itself doesn't carry).
+- **Emitter authoring tools**: a verified Parameters editor with live preview, scale-curve editing,
+  texture-sampler params (wrap / UV-expand / max-aniso), and per-slot flipbook grid fields.
+- **Diagnostics**: texture-slot role tooltips + console shader-link reporting that catches silent
+  GLSL failures.
+
+---
+
+## Reverse-engineering findings (offset + meaning)
+
+Offsets reverse-engineered using open-source projects and RenderDoc.
+
+### Color / alpha / scale
+- Key counts: Color0 `0x10`, Alpha0 `0x14`, Color1 `0x18`, Alpha1 `0x1C`, Scale `0x20`.
+- 8-key curves (x,y,z,Time): Color0 `0x370`, Alpha0 `0x3F0`, Color1 `0x470`, Alpha1 `0x4F0`,
+  Scale `0x5B0`; constant colors ConstColor0 `0x958`, ConstColor1 `0x968`.
+- Base particle radius `0x360`.
+
+### Render state (verified vs captured GPU pipeline)
+- `blendType` `0x88D`, 0 = alpha, 1 = additive (refuted the earlier `0x8DC` guess).
+- `zBufATestType` `0x88E`, 0 = depth-test / no-write, 1 = ignore-Z.
+- `displaySide` `0x84F`, 0 = both, 1 = front (cull back), 2 = back (cull front).
+
+### Motion / emission
+- `lifespan` `0x6F0`, `emitRate` `0x6F4`, `emitInterval` `0x710`, `emitFunction/volumeType` `0x714`,
+  `endFrame` `0x780` (-1 = infinite), `allDirVel` `0x7B0`, `airResist` `0x6DC`,
+  `dispersionAngle` `0x7F4`, `arcLength` `0x7F0`, `volumeScale` VEC3 `0x808/0x80C/0x814`,
+  emission `dir` VEC3 `0x7C8`, `dirVel` `0x7D4`.
+- Decoded the nw::eft **two-stage emission velocity** model (omnidirectional shape-burst + directional
+  cone) from the NW4F-Eft decomp.
+- Established that **gravity is effectively flag-off in BotW**: no isolable downward-Y accel VEC3
+  exists across 9,572 emitters; falling vs rising is carried by the emission direction.
+- Velocity is a plain big-endian float (no fixed-point /10), capture-confirmed.
+
+### Rotation
+- Z-rotation init `0x6C8` (2*pi sentinel = random orientation), `angularVelocity` `0x6D8`,
+  `momentumRandom` `0x7C4`.
+
+### Particle / render type
+- `vertexTransformMode` `0x8F4`, 0 = billboard, 2 = trail stripe, 3 = connection stripe;
+  VS-verified as CPU-built strip geometry (not GPU velocity-stretch).
+
+### Textures & flipbook
+- 3 real texture sampler slots @ `0x9A8` (3 x 0x20; low 32 bits = texture hash; empty = 0xFFFFFFFF).
+- **Per-slot flipbook grid** (cols/rows): slot0 `0x2B8/0x2BC`, slot1 `0x308/0x30C`, slot2 `0x358/0x35C`
+  (stride 0x50). Fixed emitters that drew their whole atlas at once.
+- **Static flipbook cell index** `0xD0`, the per-emitter cell pick; proven by the 12 `Flower` emitters
+  each holding cell 0..11 of one 4x4 atlas (static variants, never an animation).
+- Per-axis texture wrap: `wrapU` @ sampler+`0x08`, `wrapV` @ sampler+`0x09` (0 = mirror, 1 = repeat,
+  2 = clamp); separate UV-expand flag @ sampler+`0x17`; `maxAniso` @ sampler+`0x0C`.
+- Decoded the nw::eft texture-pattern-animation mechanism (enable / period / used-size / clamp /
+  random-start + a cell indirection table) from the decomp; BotW relocated the block, so the static
+  cell is the verified faithful default.
+
+### Combiner / fragment shading
+- 3-texture FragmentComposite ops (0=Mul 1=Add 2=Sub 3=Max): `textureColorBlend` `0x8AD`,
+  `primitiveColorBlend` `0x8AE`, `textureAlphaBlend` `0x8B1`, `primitiveAlphaBlend` `0x8B2`.
+- `fragmentColorMode` `0x8A8`, `fragmentAlphaMode` `0x8A9`, value 3 = subtract/erosion alpha
+  (`clamp(texAlpha - particleAlpha)`), gated to the erosion (low-birth-alpha) signature.
+- slot2 is a coverage mask multiplied **within** the slot0/slot1 shape, never added on top
+  (capture-grounded; fixed a flooded-alpha square).
+- Distortion/refraction discriminator: `0x8B8 == 1` OR `0x701 == 3`.
+
+### Textures shading model
+- Textures are alpha / intensity **masks**; particle RGB comes from the color curves. BC4/BC5 data
+  maps contribute coverage or are skipped (normal/flow), never tinting the albedo.

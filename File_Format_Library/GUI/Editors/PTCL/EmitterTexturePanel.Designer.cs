@@ -43,7 +43,7 @@
             // 
             this.pictureBoxCustom1.BackColor = System.Drawing.Color.Transparent;
             this.pictureBoxCustom1.BackgroundImage = ((System.Drawing.Image)(resources.GetObject("pictureBoxCustom1.BackgroundImage")));
-            this.pictureBoxCustom1.Location = new System.Drawing.Point(3, 26);
+            this.pictureBoxCustom1.Location = new System.Drawing.Point(3, 50);
             this.pictureBoxCustom1.Name = "pictureBoxCustom1";
             this.pictureBoxCustom1.Size = new System.Drawing.Size(70, 70);
             this.pictureBoxCustom1.SizeMode = System.Windows.Forms.PictureBoxSizeMode.Zoom;
@@ -54,7 +54,7 @@
             // 
             this.pictureBoxCustom2.BackColor = System.Drawing.Color.Transparent;
             this.pictureBoxCustom2.BackgroundImage = ((System.Drawing.Image)(resources.GetObject("pictureBoxCustom2.BackgroundImage")));
-            this.pictureBoxCustom2.Location = new System.Drawing.Point(79, 26);
+            this.pictureBoxCustom2.Location = new System.Drawing.Point(79, 50);
             this.pictureBoxCustom2.Name = "pictureBoxCustom2";
             this.pictureBoxCustom2.Size = new System.Drawing.Size(70, 70);
             this.pictureBoxCustom2.SizeMode = System.Windows.Forms.PictureBoxSizeMode.Zoom;
@@ -65,7 +65,7 @@
             // 
             this.pictureBoxCustom3.BackColor = System.Drawing.Color.Transparent;
             this.pictureBoxCustom3.BackgroundImage = ((System.Drawing.Image)(resources.GetObject("pictureBoxCustom3.BackgroundImage")));
-            this.pictureBoxCustom3.Location = new System.Drawing.Point(155, 26);
+            this.pictureBoxCustom3.Location = new System.Drawing.Point(155, 50);
             this.pictureBoxCustom3.Name = "pictureBoxCustom3";
             this.pictureBoxCustom3.Size = new System.Drawing.Size(70, 70);
             this.pictureBoxCustom3.SizeMode = System.Windows.Forms.PictureBoxSizeMode.Zoom;
@@ -102,7 +102,7 @@
             this.Controls.Add(this.pictureBoxCustom2);
             this.Controls.Add(this.pictureBoxCustom1);
             this.Name = "EmitterTexturePanel";
-            this.Size = new System.Drawing.Size(233, 102);
+            this.Size = new System.Drawing.Size(233, 124);
             ((System.ComponentModel.ISupportInitialize)(this.pictureBoxCustom1)).EndInit();
             ((System.ComponentModel.ISupportInitialize)(this.pictureBoxCustom2)).EndInit();
             ((System.ComponentModel.ISupportInitialize)(this.pictureBoxCustom3)).EndInit();

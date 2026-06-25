@@ -480,6 +480,10 @@ namespace Toolbox.Library
 
         private void drawContainersCB_SelectedIndexChanged(object sender, EventArgs e)
         {
+            //Picking a specific model turns "Display All" off so that model actually shows.
+            if (drawContainersCB.SelectedIndex > 0 && chkDisplayAllModels.Checked)
+                chkDisplayAllModels.Checked = false;
+
             if (chkDisplayAllModels.Checked)
             {
                 DrawAllActive();

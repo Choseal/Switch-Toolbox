@@ -382,6 +382,7 @@
     <Compile Include="FileFormats\DKCTF\MSBT.cs" />
     <Compile Include="FileFormats\DKCTF\PAK.cs" />
     <Compile Include="FileFormats\Effects\ESET.cs" />
+    <Compile Include="FileFormats\Effects\Gx2ShaderDecompiler.cs" />
     <Compile Include="FileFormats\HedgehogEngine\HeaderCommon.cs" />
     <Compile Include="FileFormats\HedgehogEngine\HedgeModel.cs" />
     <Compile Include="FileFormats\HedgehogEngine\PACx.cs" />
@@ -522,6 +523,7 @@
     <Compile Include="GL\BFRES\BFRESRenderBase.cs" />
     <Compile Include="GL\BMD_Renderer.cs" />
     <Compile Include="GL\CMB_Renderer.cs" />
+    <Compile Include="GL\EftEmitterRender.cs" />
     <Compile Include="GL\G1M_Renderer.cs" />
     <Compile Include="GL\GXToOpenGL.cs" />
     <Compile Include="GL\KCL_Render.cs" />
@@ -1553,6 +1555,7 @@
     <Compile Include="FileFormats\Collision\KCL.cs" />
     <Compile Include="FileFormats\Message\MSBT.cs" />
     <Compile Include="FileFormats\Effects\PCTL.cs" />
+    <Compile Include="FileFormats\Effects\PCTL.Eftb.cs" />
     <Compile Include="FileFormats\Archives\SARC.cs" />
     <Compile Include="FileFormats\Shader\SHARC\SHARC.cs" />
     <Compile Include="FileFormats\Texture\BNTX.cs" />
@@ -2335,4 +2338,8 @@
     <Content Include="Resources\Hashes\Pkmn.txt" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <!-- Ship the GX2->GLSL decompiler (and its license NOTICE) next to the plugin so the shader viewer finds it. -->
+  <Target Name="CopyGx2Dec" AfterTargets="Build">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)gx2dec.exe;$(MSBuildThisFileDirectory)gx2dec.NOTICE.txt" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" ContinueOnError="true" />
+  </Target>
 </Project>
