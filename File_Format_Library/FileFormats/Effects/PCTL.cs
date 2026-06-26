@@ -79,6 +79,60 @@ namespace FirstPlugin
             return null;
         }
 
+        //Reveal the emitter SET named setName in any loaded .sesetlist, for the ELink viewer's "open original
+        //emitter" link. An ELink RuntimeAssetName is the emitter-set name, byte-identical to the ESET node's Text
+        //(verified). Returns false when no open file holds it, so the caller can prompt to open the right file.
+        public static bool TrySelectEmitterSet(string setName)
+        {
+            if (string.IsNullOrEmpty(setName)) return false;
+            var node = FindEsetNode(setName, StringComparison.Ordinal)
+                    ?? FindEsetNode(setName, StringComparison.OrdinalIgnoreCase);
+            var tv = node?.TreeView;
+            if (tv == null) return false;
+            tv.FindForm()?.Activate();   //bring the owning ObjectEditor window forward
+            tv.SelectedNode = node;
+            node.EnsureVisible();
+            return true;
+        }
+        private static SectionBase FindEsetNode(string setName, StringComparison cmp)
+        {
+            foreach (var ptcl in LoadedFiles)
+            {
+                var hit = FindSection(ptcl.Nodes, s => s.Signature == "ESET" && string.Equals(s.Text, setName, cmp));
+                if (hit != null) return hit;
+            }
+            return null;
+        }
+        private static SectionBase FindSection(TreeNodeCollection nodes, Func<SectionBase, bool> match)
+        {
+            foreach (TreeNode n in nodes)
+            {
+                if (n is SectionBase sb && match(sb)) return sb;
+                var deep = FindSection(n.Nodes, match);
+                if (deep != null) return deep;
+            }
+            return null;
+        }
+
+        //All emitters of the loaded emitter SET named setName, for the ELink viewer's in-panel preview. Empty if no
+        //open .sesetlist holds the set. Same name match as TrySelectEmitterSet (RuntimeAssetName == ESET node Text).
+        public static List<Emitter> GetEmitterSetEmitters(string setName)
+        {
+            var list = new List<Emitter>();
+            if (string.IsNullOrEmpty(setName)) return list;
+            var eset = FindEsetNode(setName, StringComparison.Ordinal) ?? FindEsetNode(setName, StringComparison.OrdinalIgnoreCase);
+            if (eset != null) CollectEmitters(eset.Nodes, list);
+            return list;
+        }
+        private static void CollectEmitters(TreeNodeCollection nodes, List<Emitter> outl)
+        {
+            foreach (TreeNode n in nodes)
+            {
+                if (n is SectionBase sb && sb.Signature == "EMTR" && sb.BinaryData is Emitter em) outl.Add(em);
+                CollectEmitters(n.Nodes, outl);
+            }
+        }
+
         bool IsWiiU = false;
         bool Is3DS = false;
 

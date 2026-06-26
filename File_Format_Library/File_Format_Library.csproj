@@ -1000,6 +1000,7 @@
     <Compile Include="FileFormats\Texture\NUT.cs" />
     <Compile Include="FileFormats\Texture\TEX3DS.cs" />
     <Compile Include="FileFormats\XLINK\XLINK.cs" />
+    <Compile Include="FileFormats\XLINK\ELink2DB.cs" />
     <Compile Include="GL\GFBMDL_Render.cs" />
     <Compile Include="GL\GMX_Renderer.cs" />
     <Compile Include="GL\Helpers\DepthGLControl.cs" />

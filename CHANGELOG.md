@@ -1,5 +1,59 @@
 # BotW EFT Renderer Changelog
 
+## v6: ELink2 effect-link viewer and editor (2026-06-26)
+
+A viewer and editor for BotW's `Bootup.pack/ELink2/ELink2DB.belnk` (the effect-link database, xlink2
+big-endian version 0x1E). The game plays emitter sets through ELink, which can override their params and gate
+them by runtime state, so this exposes and edits that second data source alongside the `.sesetlist` editor.
+
+### Viewer
+- **ELink2DB tree**: one folder per effect "user" (the actor or system that triggers effects), its
+  AssetCallTable tree (Switch / Random / Blend / Sequence containers show their watch property and branch
+  condition inline), and an Actions / Triggers list (event or property to asset, with frame ranges). User
+  blocks build lazily on expand, since the file holds 1345 users.
+- **User names**: the file stores only a CRC32 of each user name, so users show as hashes unless an optional
+  sidecar `<file>.belnk.names.txt` (one user name per line) is present; matching names are labelled, the rest
+  stay hashes.
+- **Open original emitter set**: the asset panel links to the emitter set the asset plays; clicking selects
+  and reveals that ESET node in any open `.sesetlist` (including one in another window), or names the set if
+  none is open. The ELink set name is byte-identical to the `.sesetlist` set name (verified), so the match is exact.
+- **In-panel preview with overrides applied**: the asset panel renders the referenced emitter set beside its
+  data, with the ELink overrides applied as multipliers (Scale, LifeScale, DirectionalVel, EmissionRate /
+  Interval, EmissionScale, and colour / alpha) so the preview matches how the game plays the effect, not the raw
+  set. It reuses the emitter renderer in a single shared GL host; the override multipliers default to identity,
+  so the existing emitter editor is unchanged. Needs the matching `.sesetlist` open (a hint is shown otherwise).
+  `Duration` bounds the preview's emission window (a timed effect plays one puff then replays, instead of
+  emitting endlessly). Curve / random overrides use a representative constant (curve first-point / random
+  midpoint). Not modelled (the renderer draws at origin, has no character skeleton): Bone / Position / Rotation /
+  Matrix and the engine-internal `val*` params; those show in the data panel but not the viewport.
+
+### Editing
+- **Asset panel is a PropertyGrid** (matching the emitter Parameters tab). It lists every asset param; a blank
+  value means "not overridden". Type a value to add or set the override, clear it (or right-click and Reset) to
+  remove it, so unset params are never written as defaults. Set overrides show bold, strings show bare (the
+  quoting is handled on save), and the row description states the real param type and override kind.
+- **Add, edit and remove overrides, isolated per asset.** Override blocks are de-duplicated (one block can back
+  1000+ assets), so a naive in-place edit would change every asset sharing a block. The edited asset is given a
+  private (copy-on-write) copy of its block, appended at the end of the ResParam region, and only that asset is
+  repointed, so an edit touches exactly one asset and its block-mates are untouched (verified: one of 1002
+  sharers changed). Within the private block, repeated value edits reuse a spare (unreferenced) directValueTable
+  slot so shared values are never disturbed.
+- **Float params are expandable** to a Mode (NotSet / Constant / Random): Constant shows one Value, Random shows
+  Min and Max, and the parent row summarises ("0.5", "-0.025 .. 0.025", or "(not set)"). Setting Mode to Random
+  or editing Min/Max writes a RandomLinear override; a random entry is reused when an identical min/max exists,
+  edited in place when this param owns it, or appended to the randomTable. The randomTable lives mid-file, so
+  when it grows the curve, point, exRegion, condition and name regions after it shift and all their offsets are
+  fixed up. Only Float params can be random (verified from the data), so other types stay single fields.
+- **String overrides are editable** (e.g. the emitter set an asset plays): the new name is reused from the name
+  pool or appended to it (the pool is the last region, so appending only grows the file end).
+- Appending blocks at the end of the ResParam region means existing block offsets never move, so every region
+  not rebuilt (TriggerOverwrite table, sorted tables, conditions, value tables, name pool) stays byte-verbatim,
+  sidestepping the file's hidden cross-references. Save writes the bytes and the toolbox re-applies Yaz0.
+- Every byte mechanism was prototyped and verified in Python against the real file (each re-parses clean across
+  all 1345 users) before porting: value edit, add, remove, copy-on-write isolation, string edit, and growing the
+  randomTable (17k+ random / curve refs intact; a random-range edit on a block shared 1227 ways changed exactly
+  one asset).
+
 ## v5: Editing polish and preview fixes (2026-06-25)
 
 Usability fixes from hands-on testing.
@@ -19,10 +73,6 @@ Usability fixes from hands-on testing.
   purpose-built "Export mesh (.obj)" / "Replace mesh (.obj)" / "Delete Primitive" items remain.
 
 ## v4: Review hardening (2026-06-25)
-
-A maintainer-style pass over the whole diff against stock Switch-Toolbox: real-bug fixes, defensive
-hardening, and comment/encoding cleanup so the change reads as a presentable pull request. No feature
-changes; build stays green.
 
 ### Fixes
 - **Cross-file resource pool leak**: the per-file texture/primitive lists were appended on every reparse

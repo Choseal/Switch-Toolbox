@@ -463,6 +463,7 @@ namespace FirstPlugin
             Formats.Add(typeof(TXTG));
 
             //Formats.Add(typeof(XLINK_FILE));
+            Formats.Add(typeof(ELink2DB));
 
             //  Formats.Add(typeof(MPBIN));
             //  Formats.Add(typeof(HSF));

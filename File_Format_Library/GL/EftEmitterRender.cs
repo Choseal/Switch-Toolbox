@@ -260,8 +260,27 @@ namespace FirstPlugin
                 for(int c=0;c<comps;c++) outv[c]=keys[m-1,c];
             }
             float[] _c=new float[4];
-            public Vector3 ColorAt(float t){ if(Color0N==0) return ConstColor0; Sample(Color0,Color0N,t,3,_c); return new Vector3(_c[0],_c[1],_c[2]); }
-            public float AlphaAt(float t){ if(Alpha0N==0) return 1f; Sample(Alpha0,Alpha0N,t,1,_c); return _c[0]; }
+            // ELink override multipliers (identity by default), applied in the read path so billboard/stripe/mesh all get them.
+            public Vector3 ColorMul = Vector3.One; public float AlphaMul = 1f;
+            public Vector3 ColorAt(float t){
+                Vector3 c;
+                if(Color0N==0) c = ConstColor0; else { Sample(Color0,Color0N,t,3,_c); c = new Vector3(_c[0],_c[1],_c[2]); }
+                return new Vector3(c.X*ColorMul.X, c.Y*ColorMul.Y, c.Z*ColorMul.Z);
+            }
+            public float AlphaAt(float t){ if(Alpha0N==0) return AlphaMul; Sample(Alpha0,Alpha0N,t,1,_c); return _c[0]*AlphaMul; }
+            // Apply ELink asset overrides. Every param is a MULTIPLIER (ParamDefine defaults are all 1.0): motion/emission
+            // scale the decoded fields; colour/alpha go through ColorMul/AlphaMul above. Position/Rotation/Duration are not
+            // modelled by this renderer (it draws at origin and loops), so they are intentionally ignored.
+            public void ApplyOverride(EftOverride o){
+                if(o==null || !o.HasAny) return;
+                Radius *= o.ScaleMul;
+                if(o.LifeMul!=1f) Lifespan = Math.Max(1,(int)Math.Round(Lifespan*o.LifeMul));
+                DirVel *= o.DirVelMul;                                   // DirectionalVel = the Stage-2 directional speed only
+                EmitRate *= o.EmitRateMul;
+                if(o.EmitIntervalMul!=1f) EmitInterval = Math.Max(1,(int)Math.Round(EmitInterval*o.EmitIntervalMul));
+                if(o.EmitVolMul!=1f) VolScale = new Vector3(VolScale.X*o.EmitVolMul, VolScale.Y*o.EmitVolMul, VolScale.Z*o.EmitVolMul); // EmissionScale -> emission-region size
+                ColorMul = o.RgbMul; AlphaMul = o.AlphaMul;
+            }
             public float ScaleAt(float t){ if(ScaleN==0) return 1f; Sample(Scale,ScaleN,t,1,_c); return _c[0]; }
             // Scale has separate X,Y keys; the billboard used X only (a square), collapsing thin-tall sprites (Line_* :
             // scaleX 0.01 / scaleY 0.55) to an invisible dot. Expose both so the quad can be non-uniform (a visible line).
@@ -319,9 +338,17 @@ namespace FirstPlugin
         readonly Vector3[] emPath = new Vector3[256]; bool emPathInit = false;
         Vector3 EmitterAt(int fr){ if(!emPathInit || fr<0) return Vector3.Zero; return emPath[((fr%emPath.Length)+emPath.Length)%emPath.Length]; }
 
-        public EftEmitterRender(IEnumerable<EmitterInput> inputs)
+        // ELink asset override multipliers carried into the preview; all default to identity (no change).
+        public class EftOverride {
+            public float ScaleMul=1f, LifeMul=1f, DirVelMul=1f, EmitRateMul=1f, EmitIntervalMul=1f, AlphaMul=1f, EmitVolMul=1f;
+            public Vector3 RgbMul = Vector3.One;
+            public int DurationFrames=0;   // 0 = no override; >0 bounds the set's emission window (see ctor)
+            public bool HasAny;
+        }
+
+        public EftEmitterRender(IEnumerable<EmitterInput> inputs, EftOverride ovr = null)
         {
-            foreach (var inp in inputs){ var de=new DrawEmitter(inp); if(de.Drawable) emitters.Add(de); }
+            foreach (var inp in inputs){ var de=new DrawEmitter(inp); de.ApplyOverride(ovr); if(de.Drawable) emitters.Add(de); }
             float maxr=0.1f, maxs=1f;
             foreach(var e in emitters){ maxr=Math.Max(maxr,e.Radius); for(int k=0;k<8;k++) maxs=Math.Max(maxs,e.Scale[k,0]); }
             viewScale = 70f/(maxr*maxs+4f); motionScale = Math.Max(0.5f, maxr*maxs);
@@ -341,6 +368,14 @@ namespace FirstPlugin
             else {
                 int cyc=90; foreach(var e in emitters) cyc=Math.Max(cyc, Math.Max(e.Lifespan, (e.EndFrame>=2)?e.EndFrame:0));
                 cycle=Math.Min(600, cyc+ONESHOT_GAP);                                   // ambient stream: small gap only
+            }
+            // ELink Duration override (frames): the asset bounds the effect's emission window, so a timed effect (e.g. a
+            // 30-60f breath) emits for Duration frames, lets its particles live out, pauses, then replays -> one puff in
+            // the preview rather than an endless stream. Without it the looping preview over-emits short timed effects.
+            if (ovr != null && ovr.DurationFrames > 0){
+                oneShotEffect = true;
+                effectActive = Math.Max(1, ovr.DurationFrames);
+                cycle = Math.Min(600, effectActive + maxLife + ONESHOT_PAUSE);
             }
             // camera frame radius: frame to the effect's SIZE (sprite size + emission-region), NOT the farthest a fast
             // particle travels. Chasing max-travel let one fast spray (Debris allDirVel 64 -> thousands of units) blow the
