@@ -1,5 +1,24 @@
 # BotW EFT Renderer Changelog
 
+## v7: ELink2 node editing: create, delete and duplicate call nodes (2026-06-27)
+
+### Added
+- **Create, delete and duplicate ELink call nodes** from the asset-call tree (right-click).
+  - *Delete* removes a leaf or a whole container subtree. It cascades: a container left with no children is removed,
+    and any trigger that fires a removed node is removed along with its now-empty action and slot.
+  - *Duplicate* clones a node or subtree as a sibling with a `_copy` name. Duplicating a top-level effect also clones
+    the trigger that fires it, so the copy is an independent, playable effect.
+  - *Add* inserts a new asset leaf, or a Blend container with one child, under a container, or a new top-level effect.
+    A top-level effect also gets an alwaysTrigger, since a node that no trigger points at is never reached by the game.
+    The emitter set a new node plays is chosen from a dropdown of the sets in any open `.sesetlist`. The new or
+    duplicated node is selected in the tree.
+- The edited user's call list is rebuilt and spliced back in place: the call table is re-laid-out (top-level calls
+  first, then a depth-first pass that gives each node's children a contiguous index block, matching the game's own
+  layout), the name-sorted call-index table is regenerated, the trigger range tables are kept consistent, and the
+  regions after the edited user shift by the size delta. Each mechanism was prototyped and verified in Python against
+  the real file, then the C# was exercised headlessly against the same file, with every edit re-parsing clean across
+  all 1345 users.
+
 ## v6: ELink2 effect-link viewer and editor (2026-06-26)
 
 A viewer and editor for BotW's `Bootup.pack/ELink2/ELink2DB.belnk` (the effect-link database, xlink2

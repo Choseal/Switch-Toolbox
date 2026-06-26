@@ -133,6 +133,23 @@ namespace FirstPlugin
             }
         }
 
+        //Distinct emitter-set names across every open .sesetlist, sorted, for the ELink create dialog's set dropdown.
+        public static List<string> GetEmitterSetNames()
+        {
+            var seen = new HashSet<string>(); var names = new List<string>();
+            foreach (var ptcl in LoadedFiles) CollectSetNames(ptcl.Nodes, seen, names);
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            return names;
+        }
+        private static void CollectSetNames(TreeNodeCollection nodes, HashSet<string> seen, List<string> outl)
+        {
+            foreach (TreeNode n in nodes)
+            {
+                if (n is SectionBase sb && sb.Signature == "ESET" && seen.Add(sb.Text)) outl.Add(sb.Text);
+                CollectSetNames(n.Nodes, seen, outl);
+            }
+        }
+
         bool IsWiiU = false;
         bool Is3DS = false;
 
