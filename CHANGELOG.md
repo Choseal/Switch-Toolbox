@@ -1,5 +1,30 @@
 # BotW EFT Renderer Changelog
 
+## v8: ELink2 actor editing: create, delete, duplicate and rename user entries (2026-06-27)
+
+### Added
+- **Create, delete, duplicate and rename whole actors** (the user entries that own an effect setup).
+  - Right-click the file: *Add actor* makes a new empty actor (give it effects with the node tools).
+  - Right-click an actor: *Duplicate actor* clones its entire effect setup under a new actor name (the clone plays
+    the same effects, sharing the global blocks, and later edits stay isolated copy-on-write); *Rename actor*
+    recomputes the name hash and re-sorts the lookup table in place (the block does not move, so the file size is
+    unchanged); *Delete actor* removes the actor and all its effects.
+  - An actor name is hashed (CRC32) into the sorted lookup table; a name that collides with an existing actor is
+    rejected, and the last actor cannot be deleted. The new actor is selected and labelled by the typed name.
+- **Actor names persist across save and reload.** The file stores only a CRC32 of each name, so added or renamed
+  actor names are written to a `<file>.names.txt` sidecar on save (merged non-destructively with any existing one),
+  which the viewer reads back on load. Without this, a custom actor reopened as its raw hash.
+- The UserDataTable (sorted name-hashes plus parallel exRegion offsets) and the actor's block are inserted or removed
+  together, and the ParamDefineTable (a derived position) plus every region after the header shift accordingly. The
+  parser now derives that position from the actor count instead of assuming a fixed offset. Each mechanism was
+  prototyped and verified in Python against the real file, then the C# was checked headlessly to match byte-for-byte,
+  with every edit re-parsing clean across all actors.
+
+### Changed
+- Clearer effect-creation wording: the menu items are now *Add effect* and *Add effect group (Blend)*, and the create
+  dialog explains each option and labels its fields (Effect / Group name, First effect name, Emitter set).
+- `.sbelnk` (the Yaz0-compressed form) now appears in the Open dialog's supported-files filter.
+
 ## v7: ELink2 node editing: create, delete and duplicate call nodes (2026-06-27)
 
 ### Added

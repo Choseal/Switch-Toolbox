@@ -18,12 +18,12 @@ namespace FirstPlugin
     // The format class IS the root tree node (like PTCL): users become explorer folders, the
     // AssetCallTable tree nests under them, and clicking an asset leaf opens ELinkAssetEditor.
     // Parser is a C# port of the verified elink_full.py decode. B1: in-place scalar editing of Direct overrides.
-    public class ELink2DB : TreeNodeFile, IFileFormat
+    public class ELink2DB : TreeNodeFile, IFileFormat, IContextMenuNode
     {
         public FileType FileType { get; set; } = FileType.Effect;
         public bool CanSave { get; set; }
         public string[] Description { get; set; } = new string[] { "Effect Link DB (ELink2)" };
-        public string[] Extension { get; set; } = new string[] { "*.belnk", "*.bslnk" };
+        public string[] Extension { get; set; } = new string[] { "*.belnk", "*.sbelnk", "*.bslnk" };
         public string FileName { get; set; }
         public string FilePath { get; set; }
         public IFileInfo IFileInfo { get; set; }
@@ -60,16 +60,60 @@ namespace FirstPlugin
             if (!string.IsNullOrEmpty(FilePath) && System.IO.File.Exists(FilePath + ".names.txt"))
                 Elink.LoadNames(System.IO.File.ReadAllLines(FilePath + ".names.txt"));
 
-            var order = Enumerable.Range(0, (int)Elink.NumUser).OrderBy(i => Elink.UserDisplay(i), StringComparer.OrdinalIgnoreCase);
-            foreach (int ui in order)
+            RebuildUsers();
+        }
+
+        // Rebuild the per-actor folders. Actor indices shift when actors are added or removed, so the whole list
+        // is rebuilt after an actor op rather than patched.
+        public void RebuildUsers()
+        {
+            Nodes.Clear();
+            foreach (int ui in Enumerable.Range(0, (int)Elink.NumUser).OrderBy(i => Elink.UserDisplay(i), StringComparer.OrdinalIgnoreCase))
                 Nodes.Add(new ELinkUserNode(Elink, ui));
+        }
+        public void SelectUser(int ui)
+        {
+            foreach (TreeNode n in Nodes)
+                if (n is ELinkUserNode un && un.Ui == ui) { if (TreeView != null) { TreeView.SelectedNode = n; n.EnsureVisible(); } return; }
+        }
+        public ToolStripItem[] GetContextMenuItems()
+        {
+            return new ToolStripItem[]
+            {
+                new ToolStripMenuItem("Save", null, (s, e) => SaveAction()),
+                new ToolStripMenuItem("Add actor...", null, (s, e) => DoCreateActor()),
+            };
+        }
+        void SaveAction()
+        {
+            var sfd = new SaveFileDialog { Filter = Utils.GetAllFilters(this), FileName = FileName };
+            if (sfd.ShowDialog() == DialogResult.OK) STFileSaver.SaveFileFormat(this, sfd.FileName);
+        }
+        void DoCreateActor()
+        {
+            string name = ELinkNameDialog.Ask("Add actor", "Actor name");
+            if (name == null) return;
+            int nu; string err = Elink.CreateUser(name, out nu);
+            if (!string.IsNullOrEmpty(err)) { MessageBox.Show(err, "ELink"); return; }
+            RebuildUsers(); SelectUser(nu);
         }
 
         public void Unload() { }
         public void Save(Stream stream)
         {
-            var b = Elink.Bytes;            // edited in place (no relayout); STFileSaver re-compresses to .sbelnk
+            var b = Elink.Bytes;            // STFileSaver re-compresses to .sbelnk on save
             stream.Write(b, 0, b.Length);
+            if (Elink.NamesDirty && !string.IsNullOrEmpty(FilePath)) WriteNamesSidecar();
+        }
+        // The .belnk stores only a CRC32 of each actor name, so custom names (added or renamed actors) are written
+        // to a "<file>.names.txt" sidecar, merged non-destructively with any existing one. The viewer reads it on load.
+        void WriteNamesSidecar()
+        {
+            string path = FilePath + ".names.txt";
+            var lines = new List<string>(); var seen = new HashSet<string>();
+            try { if (System.IO.File.Exists(path)) foreach (var l in System.IO.File.ReadAllLines(path)) if (seen.Add(l)) lines.Add(l); } catch { }
+            foreach (var nm in Elink.AllNames) if (seen.Add(nm)) lines.Add(nm);
+            try { System.IO.File.WriteAllLines(path, lines); } catch { }
         }
     }
 
@@ -162,9 +206,9 @@ namespace FirstPlugin
         {
             D = data;
 
-            // ParamDefineTable @ 0x2A50 (static schema: param names/types never change on edit)
-            long PDT = 0x2A50;
-            uint pdtTotal = U32(PDT);
+            // ParamDefineTable (static schema: param names/types never change on edit). Its position is derived
+            // (0x48 + NumUser*8, right after the UserDataTable), so it shifts if actor entries are added or removed.
+            long PDT = 0x48 + (long)U32(0x3C) * 8;
             NumUserParams = (int)U32(PDT + 4);
             int nAsset = (int)U32(PDT + 8);
             int nTrig = (int)U32(PDT + 16);
@@ -179,8 +223,7 @@ namespace FirstPlugin
             for (int i = 0; i < nAsset; i++)
             { long r = recs + (NumUserParams + i) * 12; AssetNames[i] = pdtStr((int)U32(r)); AssetTypes[i] = (int)U32(r + 4); }
 
-            AssetParamPos = (uint)((PDT + pdtTotal + 3) & ~3);   // start of ResParam region (before any append; never moves)
-            Reindex();
+            Reindex();   // computes AssetParamPos + the value-table positions from the header
         }
 
         // Re-read every header field, table position and user offset from the (current) buffer. Called after a
@@ -193,6 +236,9 @@ namespace FirstPlugin
             TrigPos = h[5]; LocPropPos = h[6]; NumLocProp = h[7]; NumLocEnum = h[8];
             NumDirect = h[9]; NumRandom = h[10]; NumCurve = h[11]; NumCurvePt = h[12];
             ExRegionPos = h[13]; NumUser = h[14]; CondPos = h[15]; NameTablePos = h[16];
+
+            long pdt = 0x48 + (long)NumUser * 8;                    // ParamDefineTable: derived position, moves with NumUser
+            AssetParamPos = (uint)((pdt + U32(pdt) + 3) & ~3);      // start of the ResParam region
 
             UserHashes = new uint[NumUser]; UserOffsets = new uint[NumUser];
             for (int i = 0; i < NumUser; i++) UserHashes[i] = U32(0x48 + i * 4);
@@ -1078,6 +1124,113 @@ namespace FirstPlugin
             newIndex = cont.New; return "";
         }
 
+        // =====================================================================================
+        //  Actor (whole-user) operations: create / delete / duplicate a user entry. The
+        //  UserDataTable is NumUser sorted CRC32 name-hashes followed by NumUser parallel exRegion
+        //  offsets, and the blocks are stored in that hash order. Adding or removing an actor
+        //  inserts/removes a (hash, offset) pair and the user's exRegion block; the ParamDefineTable
+        //  (derived position) and every region after the header shift, so the whole file past the
+        //  header is rebuilt and Reindex recomputes the table positions. Verified in Python.
+
+        // Reassemble: header(0x48) + UserDataTable(hashes then offsets) + content[oldPDT..spliceAt) +
+        // insert + content[spliceAt+removeLen..]. oldPDT = 0x48 + NumUser*8 (the current ParamDefineTable).
+        byte[] RebuildWithUDT(uint[] hashes, uint[] offsets, long oldPDT, long spliceAt, byte[] insert, long removeLen)
+        {
+            int udt = hashes.Length * 8, before = (int)(spliceAt - oldPDT), after = (int)(D.Length - (spliceAt + removeLen));
+            var outb = new byte[0x48 + udt + before + (insert != null ? insert.Length : 0) + after];
+            Array.Copy(D, 0, outb, 0, 0x48);
+            int q = 0x48;
+            foreach (uint h in hashes) { RW32(outb, q, h); q += 4; }
+            foreach (uint o in offsets) { RW32(outb, q, o); q += 4; }
+            Array.Copy(D, (int)oldPDT, outb, q, before); q += before;
+            if (insert != null) { Array.Copy(insert, 0, outb, q, insert.Length); q += insert.Length; }
+            Array.Copy(D, (int)(spliceAt + removeLen), outb, q, after);
+            return outb;
+        }
+        void RememberName(uint hash, string name)   // so a freshly-added actor shows by name, not hash
+        { if (NameMap == null) NameMap = new Dictionary<uint, string>(); NameMap[hash] = name; NamesDirty = true; }
+        public bool NamesDirty;   // a custom actor name was added/renamed -> the names sidecar is persisted on save
+        public IEnumerable<string> AllNames { get { return NameMap != null ? NameMap.Values : Enumerable.Empty<string>(); } }
+
+        public string DeleteUser(int ui)
+        {
+            if (NumUser <= 1) return "cannot delete the last actor";
+            long oldPDT = 0x48 + (long)NumUser * 8, B = UserOffsets[ui], S = BlockSizeAt(B);
+            int n = (int)NumUser;
+            var nh = new uint[n - 1]; var no = new uint[n - 1];
+            for (int i = 0, j = 0; i < n; i++)
+            {
+                if (i == ui) continue;
+                nh[j] = UserHashes[i];
+                uint O = UserOffsets[i]; no[j] = (uint)((long)O - 8 - (O > B ? S : 0)); j++;
+            }
+            uint h5 = TrigPos, h6 = LocPropPos, h13 = ExRegionPos, h15 = CondPos, h16 = NameTablePos;
+            D = RebuildWithUDT(nh, no, oldPDT, B, null, S);
+            WU32(4, (uint)D.Length); WU32(0x3C, NumUser - 1);
+            WU32(0x18, h5 - 8); WU32(0x1C, h6 - 8); WU32(0x38, h13 - 8);
+            WU32(0x40, (uint)((long)h15 - 8 - S)); WU32(0x44, (uint)((long)h16 - 8 - S));
+            Reindex(); _editInit = false; Dirty = true; return "";
+        }
+        // Insert a new actor (block = a clone for duplicate, or a fabricated empty user for create). newUserIndex
+        // gets the inserted user's index (its sorted hash position).
+        string InsertUser(string newName, byte[] block, out int newUserIndex)
+        {
+            newUserIndex = -1;
+            if (string.IsNullOrWhiteSpace(newName)) return "enter an actor name";
+            uint newHash = Crc32(newName);
+            int n = (int)NumUser;
+            for (int i = 0; i < n; i++) if (UserHashes[i] == newHash) return "an actor with that name (or same CRC32) already exists";
+            int pos = 0; while (pos < n && UserHashes[pos] < newHash) pos++;   // keep the hash table sorted
+            long oldPDT = 0x48 + (long)NumUser * 8;
+            int S = block.Length;
+            long blockInsertOff = pos < n ? UserOffsets[pos] : CondPos;         // clone goes just before the block now at pos
+            var nh = new uint[n + 1]; var no = new uint[n + 1];
+            for (int i = 0; i < n + 1; i++)
+            {
+                if (i == pos) { nh[i] = newHash; no[i] = (uint)(blockInsertOff + 8); continue; }
+                int src = i < pos ? i : i - 1;
+                nh[i] = UserHashes[src];
+                uint O = UserOffsets[src]; no[i] = (uint)((long)O + 8 + (O >= blockInsertOff ? S : 0));
+            }
+            uint h5 = TrigPos, h6 = LocPropPos, h13 = ExRegionPos, h15 = CondPos, h16 = NameTablePos;
+            D = RebuildWithUDT(nh, no, oldPDT, blockInsertOff, block, 0);
+            WU32(4, (uint)D.Length); WU32(0x3C, NumUser + 1);
+            WU32(0x18, h5 + 8); WU32(0x1C, h6 + 8); WU32(0x38, h13 + 8);
+            WU32(0x40, (uint)((long)h15 + 8 + S)); WU32(0x44, (uint)((long)h16 + 8 + S));
+            Reindex(); _editInit = false; Dirty = true; RememberName(newHash, newName);
+            newUserIndex = pos; return "";
+        }
+        public string DuplicateUser(int srcUi, string newName, out int newUserIndex)
+        {
+            long B = UserOffsets[srcUi]; int S = (int)BlockSizeAt(B);
+            var clone = new byte[S]; Array.Copy(D, (int)B, clone, 0, S);
+            return InsertUser(newName, clone, out newUserIndex);
+        }
+        public string CreateUser(string newName, out int newUserIndex)
+        {
+            var block = new byte[0x34]; RW32(block, 0x2C, 0x34);   // empty user: triggerTablePos=0x34, all else 0 (leafType=0)
+            return InsertUser(newName, block, out newUserIndex);
+        }
+        // Rename an actor: recompute its CRC32 and move its UserDataTable entry to the new sorted position. The block
+        // is unchanged and stays put (the offset table still maps to it), so the file size and every region are unchanged.
+        public string RenameUser(int ui, string newName, out int newUserIndex)
+        {
+            newUserIndex = ui;
+            if (string.IsNullOrWhiteSpace(newName)) return "enter an actor name";
+            uint newHash = Crc32(newName);
+            if (newHash == UserHashes[ui]) { RememberName(newHash, newName); return ""; }   // same name -> just relabel
+            int n = (int)NumUser;
+            for (int i = 0; i < n; i++) if (i != ui && UserHashes[i] == newHash) return "an actor with that name (or same CRC32) already exists";
+            var hs = (uint[])UserHashes.Clone(); var os = (uint[])UserOffsets.Clone();
+            hs[ui] = newHash;
+            var idx = new int[n]; for (int i = 0; i < n; i++) idx[i] = i;
+            Array.Sort(idx, (a, b) => hs[a].CompareTo(hs[b]));   // keep the hash table sorted
+            for (int i = 0; i < n; i++) { WU32(0x48 + i * 4, hs[idx[i]]); WU32(0x48 + (long)n * 4 + i * 4, os[idx[i]]); }
+            Reindex(); RememberName(newHash, newName); Dirty = true;
+            for (int i = 0; i < n; i++) if (UserHashes[i] == newHash) { newUserIndex = i; break; }
+            return "";
+        }
+
         // ---- decode one user ----
         public ELinkUserModel DecodeUser(int ui)
         {
@@ -1194,9 +1347,40 @@ namespace FirstPlugin
         {
             return new ToolStripItem[]
             {
-                new ToolStripMenuItem("Add Effect (asset)...", null, (s, e) => DoCreateLeaf(-1)),
-                new ToolStripMenuItem("Add Effect (Blend container)...", null, (s, e) => DoCreateContainer(-1)),
+                new ToolStripMenuItem("Add effect...", null, (s, e) => DoCreateLeaf(-1)),
+                new ToolStripMenuItem("Add effect group (Blend)...", null, (s, e) => DoCreateContainer(-1)),
+                new ToolStripSeparator(),
+                new ToolStripMenuItem("Duplicate actor...", null, (s, e) => DoDuplicateActor()),
+                new ToolStripMenuItem("Rename actor...", null, (s, e) => DoRenameActor()),
+                new ToolStripMenuItem("Delete actor", null, (s, e) => DoDeleteActor()),
             };
+        }
+        void DoDuplicateActor()
+        {
+            var root = Parent as ELink2DB; if (root == null) return;
+            string name = ELinkNameDialog.Ask("Duplicate actor", "New actor name");
+            if (name == null) return;
+            int nu; string err = elink.DuplicateUser(Ui, name, out nu);
+            if (!string.IsNullOrEmpty(err)) { MessageBox.Show(err, "ELink"); return; }
+            root.RebuildUsers(); root.SelectUser(nu);
+        }
+        void DoRenameActor()
+        {
+            var root = Parent as ELink2DB; if (root == null) return;
+            string name = ELinkNameDialog.Ask("Rename actor", "New actor name");
+            if (name == null) return;
+            int nu; string err = elink.RenameUser(Ui, name, out nu);
+            if (!string.IsNullOrEmpty(err)) { MessageBox.Show(err, "ELink"); return; }
+            root.RebuildUsers(); root.SelectUser(nu);
+        }
+        void DoDeleteActor()
+        {
+            var root = Parent as ELink2DB; if (root == null) return;
+            if (MessageBox.Show("Delete actor \"" + Text + "\" and all its effects?", "Delete actor",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            string err = elink.DeleteUser(Ui);
+            if (!string.IsNullOrEmpty(err)) { MessageBox.Show(err, "ELink"); return; }
+            root.RebuildUsers();
         }
         // parentCi < 0 = top level (a new effect, fired by a new alwaysTrigger); >= 0 nests under that container.
         public void DoCreateLeaf(int parentCi)
@@ -1275,8 +1459,8 @@ namespace FirstPlugin
             if (owner == null) return items.ToArray();
             if (call.IsContainer)
             {
-                items.Add(new ToolStripMenuItem("Add child (asset)...", null, (s, e) => owner.DoCreateLeaf(call.CallIndex)));
-                items.Add(new ToolStripMenuItem("Add child (Blend container)...", null, (s, e) => owner.DoCreateContainer(call.CallIndex)));
+                items.Add(new ToolStripMenuItem("Add effect...", null, (s, e) => owner.DoCreateLeaf(call.CallIndex)));
+                items.Add(new ToolStripMenuItem("Add effect group (Blend)...", null, (s, e) => owner.DoCreateContainer(call.CallIndex)));
                 items.Add(new ToolStripSeparator());
             }
             items.Add(new ToolStripMenuItem("Duplicate", null, (s, e) => owner.DoDuplicate(call)));
@@ -1301,25 +1485,34 @@ namespace FirstPlugin
         readonly Button ok;
         public ELinkCreateDialog(bool container)
         {
-            Text = container ? "Add Blend container" : "Add asset call";
+            Text = container ? "Add effect group (Blend)" : "Add effect";
             FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
-            StartPosition = FormStartPosition.CenterParent; ClientSize = new Size(360, container ? 172 : 136);
+            StartPosition = FormStartPosition.CenterParent;
+            const int W = 380;
+            ClientSize = new Size(W, container ? 214 : 166);
 
-            int y = 14;
-            Controls.Add(new Label { Text = container ? "Container name" : "Call name", Left = 12, Top = y + 3, Width = 120 });
-            nameBox.SetBounds(140, y, 206, 23); Controls.Add(nameBox); y += 34;
+            var hint = new Label
+            {
+                Left = 12, Top = 10, Width = W - 24, AutoSize = false, Height = container ? 44 : 26, ForeColor = Color.Gray,
+                Text = container ? "A Blend group plays several effects together. This creates the group and its first effect."
+                                 : "Plays one emitter set.",
+            };
+            Controls.Add(hint);
+            int y = hint.Bottom + 8;
+            Controls.Add(new Label { Text = container ? "Group name" : "Effect name", Left = 12, Top = y + 3, Width = 110 });
+            nameBox.SetBounds(126, y, W - 138, 23); Controls.Add(nameBox); y += 34;
             if (container)
             {
                 childBox = new TextBox();
-                Controls.Add(new Label { Text = "Child call name", Left = 12, Top = y + 3, Width = 120 });
-                childBox.SetBounds(140, y, 206, 23); Controls.Add(childBox); y += 34;
+                Controls.Add(new Label { Text = "First effect name", Left = 12, Top = y + 3, Width = 110 });
+                childBox.SetBounds(126, y, W - 138, 23); Controls.Add(childBox); y += 34;
             }
-            Controls.Add(new Label { Text = "Emitter set", Left = 12, Top = y + 3, Width = 120 });
-            setBox.SetBounds(140, y, 206, 23); setBox.DropDownStyle = ComboBoxStyle.DropDown;
+            Controls.Add(new Label { Text = "Emitter set", Left = 12, Top = y + 3, Width = 110 });
+            setBox.SetBounds(126, y, W - 138, 23); setBox.DropDownStyle = ComboBoxStyle.DropDown;
             setBox.Items.AddRange(PTCL.GetEmitterSetNames().ToArray()); Controls.Add(setBox); y += 42;
 
-            ok = new Button { Text = "OK", DialogResult = DialogResult.OK }; ok.SetBounds(178, y, 80, 26);
-            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel }; cancel.SetBounds(266, y, 80, 26);
+            ok = new Button { Text = "OK", DialogResult = DialogResult.OK }; ok.SetBounds(W - 178, y, 80, 26);
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel }; cancel.SetBounds(W - 90, y, 80, 26);
             Controls.Add(ok); Controls.Add(cancel);
             AcceptButton = ok; CancelButton = cancel;
             EventHandler v = (s, e) => ok.Enabled = NodeName.Length > 0 && EmitterSet.Length > 0 && (childBox == null || ChildName.Length > 0);
@@ -1329,6 +1522,28 @@ namespace FirstPlugin
         public string NodeName { get { return nameBox.Text.Trim(); } }
         public string ChildName { get { return childBox != null ? childBox.Text.Trim() : ""; } }
         public string EmitterSet { get { return setBox.Text.Trim(); } }
+    }
+
+    // A one-field name prompt for adding or duplicating an actor; returns null on cancel.
+    class ELinkNameDialog : Form
+    {
+        readonly TextBox box = new TextBox();
+        ELinkNameDialog(string title, string label)
+        {
+            Text = title; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent; ClientSize = new Size(324, 104);
+            Controls.Add(new Label { Text = label, Left = 12, Top = 16, Width = 92 });
+            box.SetBounds(110, 13, 200, 23); Controls.Add(box);
+            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK }; ok.SetBounds(142, 60, 80, 26);
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel }; cancel.SetBounds(230, 60, 80, 26);
+            Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
+            EventHandler v = (s, e) => ok.Enabled = box.Text.Trim().Length > 0; box.TextChanged += v; v(null, null);
+        }
+        public static string Ask(string title, string label)
+        {
+            using (var d = new ELinkNameDialog(title, label))
+                return d.ShowDialog() == DialogResult.OK ? d.box.Text.Trim() : null;
+        }
     }
 
     // ---- editor panel --------------------------------------------------------------------------
