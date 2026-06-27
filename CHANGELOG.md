@@ -25,6 +25,12 @@
   dialog explains each option and labels its fields (Effect / Group name, First effect name, Emitter set).
 - `.sbelnk` (the Yaz0-compressed form) now appears in the Open dialog's supported-files filter.
 
+### Upcoming features
+- **Automatic actor-name recovery.** Because the `.belnk` stores only a CRC32 hash of each actor name, a planned
+  addition will recover the names directly from the game's actor packs (each actor's ActorLink records its ELink user)
+  and label every actor automatically. In the meantime, names are supplied by a `<file>.names.txt` sidecar (a plain
+  list matched by hash, read on load and appended to on save); any actor not covered by it shows as its raw hash.
+
 ## v7: ELink2 node editing: create, delete and duplicate call nodes (2026-06-27)
 
 ### Added
