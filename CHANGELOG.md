@@ -1,5 +1,22 @@
 # BotW EFT Renderer Changelog
 
+## v10: ELink2 curve-driven override editing (2026-06-27)
+
+### Added
+- **Edit curve-driven overrides.** A Float override whose value follows a curve (Scale, Alpha, EmissionRate,
+  LifeScale and so on) opens a curve editor from the "..." button on its row: the driving property, the curve
+  type (Standard or Constant), and a points table (X = property, Y = value) with Add / Insert above / Insert
+  below / Remove so points go anywhere. Editing gives the asset a private copy, reusing an identical curve when
+  present and otherwise appending the points and the record at their table ends, so shared curves and the rest
+  of the file stay untouched. A local-property curve's driving property is fixed, since the game keys it by index.
+- **English names beside the built-in Japanese ones.** Property and enum-value dropdowns gloss the game's
+  built-in names, for example "速度  (Speed)" and "天候  (Weather)". The stored value is always the original; a
+  typed name is kept as-is.
+
+### Changed
+- *Edit triggers* moved from the actor's menu to its **Triggers** folder (right-click it); the folder now always
+  shows, so an actor with no triggers can still add one.
+
 ## v9: ELink2 trigger and condition editing, and Switch/Random/Sequence groups (2026-06-27)
 
 ### Added

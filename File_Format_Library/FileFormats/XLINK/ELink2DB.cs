@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
@@ -141,6 +141,7 @@ namespace FirstPlugin
         public string Kind;      // "", "random range", "curve", "bitfield" -> shown in the description
         public int Mode;         // float params: 0 NotSet, 1 Constant, 2 Random, 3 Curve (-1 = not a float mode)
         public double Value, Min, Max;   // Constant value, or Random min/max
+        public ELinkCurve Curve; // populated when Mode == 3 (the curve's property + points)
     }
 
     public class ELinkCall
@@ -205,6 +206,17 @@ namespace FirstPlugin
         public int TargetCall;
         public int Start, End, Flags;
         public string Condition;   // property-trigger gating (display)
+    }
+
+    // A curve-driven override: the value follows the Points (x = the driving property, y = the value)
+    // as the property changes. Type 0 = Standard (linear), 1 = Constant.
+    public class ELinkCurve
+    {
+        public int Type;
+        public string Property;
+        public bool IsGlobal;
+        public int LocalIndex;
+        public List<PointF> Points = new List<PointF>();
     }
 
     // ---- parser (big-endian; port of elink_full.py) --------------------------------------------
@@ -537,18 +549,24 @@ namespace FirstPlugin
         void WriteRand(int idx, float min, float max) { WU32(RND + idx * 8, FloatBits(min)); WU32(RND + idx * 8 + 4, FloatBits(max)); }
         // Append one (min,max) entry to the randomTable (it sits mid-file, so the curve/point/exRegion/condition/name
         // regions after it shift). Returns the new index.
+        // Shift the regions after a mid-file value-table insert of `len` bytes at `insAt`: FileSize, the
+        // ExRegion/Cond/Name offsets and every user offset past the insert. The caller writes the table count.
+        void ShiftAfterInsert(long insAt, int len)
+        {
+            WU32(4, U32(4) + (uint)len);                      // FileSize
+            foreach (int i in new[] { 13, 15, 16 })           // ExRegionPos, CondPos, NameTablePos
+            { uint old = U32(4 + i * 4); if (old >= insAt) WU32(4 + i * 4, old + (uint)len); }
+            long uoBase = 0x48 + NumUser * 4;
+            for (int i = 0; i < NumUser; i++) WU32(uoBase + i * 4, U32(uoBase + i * 4) + (uint)len);
+            Reindex(); _editInit = false;
+        }
         uint GrowRandom(float min, float max)
         {
             long insAt = RND + NumRandom * 8; uint newIdx = NumRandom;
             InsertBytes(insAt, new byte[8]);
             WU32(insAt, FloatBits(min)); WU32(insAt + 4, FloatBits(max));
-            WU32(4, U32(4) + 8);                              // FileSize
             WU32(4 + 10 * 4, NumRandom + 1);                  // numRandom (h10)
-            foreach (int i in new[] { 13, 15, 16 })           // ExRegionPos, CondPos, NameTablePos (after the random table)
-            { uint old = U32(4 + i * 4); if (old >= insAt) WU32(4 + i * 4, old + 8); }
-            long uoBase = 0x48 + NumUser * 4;
-            for (int i = 0; i < NumUser; i++) WU32(uoBase + i * 4, U32(uoBase + i * 4) + 8);
-            Reindex(); _editInit = false;
+            ShiftAfterInsert(insAt, 8);
             return newIdx;
         }
         // A randomTable index holding (min,max): reuse a referenced identical entry, else grow the table.
@@ -572,6 +590,74 @@ namespace FirstPlugin
             if ((rt == 3 || (rt >= 6 && rt <= 0x11)) && _randRefCount.TryGetValue(idx, out int rc) && rc == 1)
             { WriteRand(idx, min, max); Dirty = true; return ""; }                 // owns its entry -> edit in place
             WU32(rp, (3u << 24) | (uint)ResolveRandomIndex(min, max)); Dirty = true; return "";
+        }
+
+        // ---- curve-driven override editing -----------------------------------------------------
+        // A curve sits in the curve-record table with its points in the point table, both mid-file
+        // (between the random table and the exRegion) and shared across assets. Editing a curve gives
+        // the asset a private copy: reuse a byte-identical curve, else append its points at the point
+        // table end and the record at the curve-record table end (both grow like the random table).
+        uint GrowCurvePoints(PointF[] pts)
+        {
+            long insAt = CPT + NumCurvePt * 8; uint pointStart = NumCurvePt;
+            var blob = new byte[pts.Length * 8];
+            for (int k = 0; k < pts.Length; k++) { RW32(blob, k * 8, FloatBits(pts[k].X)); RW32(blob, k * 8 + 4, FloatBits(pts[k].Y)); }
+            InsertBytes(insAt, blob);
+            WU32(4 + 12 * 4, NumCurvePt + (uint)pts.Length);      // numCurvePt (h12)
+            ShiftAfterInsert(insAt, blob.Length);
+            return pointStart;
+        }
+        uint GrowCurve(byte[] rec)
+        {
+            long insAt = CRV + NumCurve * 0x14; uint curveIdx = NumCurve;
+            InsertBytes(insAt, rec);
+            WU32(4 + 11 * 4, NumCurve + 1);                        // numCurve (h11)
+            ShiftAfterInsert(insAt, rec.Length);
+            return curveIdx;
+        }
+        static byte[] CurveRecBytes(uint pointStart, int npts, int type, uint nameOff, short propIdx, bool isGlobal)
+        {
+            var r = new byte[0x14];
+            RW16(r, 0, (ushort)pointStart); RW16(r, 2, (ushort)npts); RW16(r, 4, (ushort)type); RW16(r, 6, (ushort)(isGlobal ? 1 : 0));
+            RW32(r, 8, nameOff); RW16(r, 0x10, (ushort)propIdx);
+            return r;
+        }
+        uint ResolveCurve(int type, uint nameOff, short propIdx, bool isGlobal, PointF[] pts)
+        {
+            for (uint i = 0; i < NumCurve; i++)
+            {
+                long c = CRV + i * 0x14;
+                if (U16(c + 4) != type || (U16(c + 6) != 0) != isGlobal || U32(c + 8) != nameOff || S16(c + 0x10) != propIdx || U16(c + 2) != pts.Length) continue;
+                int ps = U16(c); bool same = true;
+                for (int k = 0; k < pts.Length; k++) if (F32(CPT + (ps + k) * 8) != pts[k].X || F32(CPT + (ps + k) * 8 + 4) != pts[k].Y) { same = false; break; }
+                if (same) return i;
+            }
+            uint pointStart = GrowCurvePoints(pts);
+            return GrowCurve(CurveRecBytes(pointStart, pts.Length, type, nameOff, propIdx, isGlobal));
+        }
+        // Set a Float override to a curve. Adds the override if unset, else repoints it (copy-on-write).
+        public string SetCurveParam(int ui, int ci, int bit, int type, string propName, bool isGlobal, int localIndex, PointF[] pts)
+        {
+            if (pts == null || pts.Length < 1) return "a curve needs at least one point";
+            if ((long)NumCurvePt + pts.Length > 0xFFFF) return "too many curve points";   // pointStart is a u16 index
+            if (!isGlobal && localIndex < 0) return "local curve properties are not editable here; choose Global";
+            uint nameOff = ResolveNameOffset(propName ?? "");
+            short propIdx = (short)(isGlobal ? -1 : localIndex);
+            bool isSet = ((U64(AssetParamPos + ParamOffsetOf(ui, ci)) >> bit) & 1) != 0;
+            uint curveIdx = ResolveCurve(type, nameOff, propIdx, isGlobal, pts);
+            if (!isSet) return AddRefInternal(ui, ci, bit, (2u << 24) | curveIdx);
+            uint po = EnsurePrivateBlock(ui, ci);
+            long rp = RefPos(po, bit);
+            if (rp < 0) return "param is not overridden";
+            WU32(rp, (2u << 24) | curveIdx); Dirty = true; return "";
+        }
+        ELinkCurve ReadCurveByIndex(uint idx)
+        {
+            long c = CRV + idx * 0x14;
+            var cur = new ELinkCurve { Type = U16(c + 4), IsGlobal = U16(c + 6) != 0, LocalIndex = S16(c + 0x10), Property = Name(U32(c + 8)) };
+            int ps = U16(c), npts = U16(c + 2);
+            for (int k = 0; k < npts; k++) cur.Points.Add(new PointF(F32(CPT + (ps + k) * 8), F32(CPT + (ps + k) * 8 + 4)));
+            return cur;
         }
 
         // One entry point for float params: mode 0 = not set (remove), 1 = constant, 2 = random range.
@@ -717,7 +803,7 @@ namespace FirstPlugin
                     int rt = (int)(reff >> 24), idx = (int)(reff & 0xFFFFFF);
                     if (rt == 0) { row.Mode = 1; row.Value = ScalarOf(t, reff); }
                     else if (rt == 3 || (rt >= 6 && rt <= 0x11)) { row.Mode = 2; row.Min = F32(RND + idx * 8); row.Max = F32(RND + idx * 8 + 4); }
-                    else if (rt == 2) row.Mode = 3;
+                    else if (rt == 2) { row.Mode = 3; row.Curve = ReadCurveByIndex((uint)idx); }
                     else row.Mode = -1;     // string / bitfield -> not a float mode
                 }
                 else
@@ -1757,12 +1843,7 @@ namespace FirstPlugin
             if (m.LocalProps.Count > 0) Nodes.Add(new TreeNode("LocalProperties { " + string.Join(", ", m.LocalProps) + " }"));
             if (m.UserParams.Count > 0) Nodes.Add(new TreeNode("UserParams { " + string.Join(", ", m.UserParams.Select(kv => kv.Key + "=" + kv.Value)) + " }"));
             foreach (var c in m.Tops) Nodes.Add(ELinkCallNode.Make(elink, c));
-            if (m.TriggerLines.Count > 0)
-            {
-                var tn = new TreeNode("Triggers");
-                foreach (var line in m.TriggerLines) tn.Nodes.Add(new TreeNode(line));
-                Nodes.Add(tn);
-            }
+            Nodes.Add(new ELinkTriggersNode(this, m.TriggerLines));
         }
 
         public ToolStripItem[] GetContextMenuItems()
@@ -1771,7 +1852,6 @@ namespace FirstPlugin
             {
                 new ToolStripMenuItem("Add effect...", null, (s, e) => DoCreateLeaf(-1)),
                 new ToolStripMenuItem("Add effect group...", null, (s, e) => DoCreateContainer(-1)),
-                new ToolStripMenuItem("Edit triggers...", null, (s, e) => DoEditTriggers()),
                 new ToolStripSeparator(),
                 new ToolStripMenuItem("Duplicate actor...", null, (s, e) => DoDuplicateActor()),
                 new ToolStripMenuItem("Rename actor...", null, (s, e) => DoRenameActor()),
@@ -1880,6 +1960,20 @@ namespace FirstPlugin
             }
             return null;
         }
+    }
+
+    // The "Triggers" folder under an actor: lists the triggers and offers Edit triggers. Always shown,
+    // so an actor with none yet can still add one.
+    public class ELinkTriggersNode : TreeNodeCustom, IContextMenuNode
+    {
+        readonly ELinkUserNode owner;
+        public ELinkTriggersNode(ELinkUserNode o, List<string> lines)
+        {
+            owner = o; Text = "Triggers";
+            foreach (var line in lines) Nodes.Add(new TreeNode(line));
+        }
+        public ToolStripItem[] GetContextMenuItems()
+        { return new ToolStripItem[] { new ToolStripMenuItem("Edit triggers...", null, (s, e) => owner.DoEditTriggers()) }; }
     }
 
     // a call node is either a container folder (with child calls) or a clickable asset leaf.
@@ -2013,6 +2107,44 @@ namespace FirstPlugin
         public string EmitterSet { get { return setBox.Text.Trim(); } }
     }
 
+    // Optional English glosses for the game's built-in Japanese property and enum names, shown next to the
+    // original in the dropdowns. The stored value is always the original; this is display only.
+    static class ELinkLang
+    {
+        static readonly Dictionary<string, string> En = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            { "速度", "Speed" }, { "スピード", "Speed" }, { "垂直速度", "Vertical speed" }, { "水平速度", "Horizontal speed" }, { "回転速度", "Rotation speed" },
+            { "状態", "State" }, { "ステータス", "Status" }, { "ステータス右腕", "Status (right arm)" }, { "ステータス左腕", "Status (left arm)" }, { "シーン状態", "Scene state" }, { "モデル表示状態", "Model display state" },
+            { "スケール", "Scale" }, { "Xスケール", "X scale" }, { "Yスケール", "Y scale" }, { "スケールタイプ", "Scale type" }, { "ロッドスケール", "Rod scale" }, { "火柱スケール", "Fire-pillar scale" },
+            { "マテリアル", "Material" }, { "水マテリアル", "Water material" }, { "サブマテリアル", "Sub-material" }, { "近傍マテリアル", "Nearby material" }, { "テクスチャタイプ", "Texture type" },
+            { "カメラとの距離", "Camera distance" }, { "プレイヤーとの距離", "Player distance" }, { "カメラ位置が屋内", "Camera indoors" }, { "カメラ画角", "Camera FOV" },
+            { "パワー", "Power" }, { "ケミカルパワー", "Chemical power" }, { "イベント", "Event" }, { "騎乗者", "Rider" }, { "死亡", "Death" },
+            { "Maxエフェクト", "Max effect" }, { "エフェクト負荷", "Effect load" }, { "スロー状態", "Slow-mo state" }, { "ポーズ状態", "Pause state" }, { "ゲーム状態", "Game state" }, { "シーンタイプ", "Scene type" },
+            { "天候", "Weather" }, { "時刻", "Time of day" }, { "時間帯", "Time period" }, { "気温", "Temperature" }, { "風の強さ", "Wind strength" }, { "受ける風の強さ", "Wind strength (received)" }, { "受けている風の上向きの強さ", "Upward wind strength" }, { "上昇気流", "Updraft" },
+            { "地方", "Region" }, { "生態系エリア", "Ecosystem area" }, { "室内率", "Indoor ratio" }, { "露出", "Exposure" }, { "怨念", "Malice" }, { "プレイヤー滞空時間", "Player airtime" },
+            { "濃度:暗闇", "Density: darkness" }, { "濃度:雨", "Density: rain" }, { "濃度:ＢＭ", "Density: malice" }, { "濃度:砂嵐", "Density: sandstorm" }, { "濃度:火粉", "Density: embers" }, { "濃度:胞子", "Density: spores" }, { "濃度:霧", "Density: fog" },
+            { "水面が移動中", "Water surface moving" }, { "滝の中", "In waterfall" }, { "地面の濡れ具合", "Ground wetness" }, { "濡れ具合", "Wetness" }, { "足の濡れ具合", "Foot wetness" },
+            { "深さ(Rea)", "Depth" }, { "パラセイル中の高度", "Paraglider altitude" }, { "壁登り角度", "Wall-climb angle" }, { "盾サーフィン時の盾角度", "Shield-surf angle" }, { "落葉タイプ", "Falling-leaf type" }, { "落葉密度", "Falling-leaf density" },
+            { "通常", "Normal" }, { "硬直", "Stunned" }, { "炎", "Fire" }, { "なし", "None" }, { "カエデ", "Maple" }, { "広葉樹", "Broadleaf" }, { "針葉樹", "Conifer" }, { "上昇中", "Rising" }, { "プレイヤー", "Player" }, { "ケミカルON", "Chemical on" },
+            { "スロー中", "In slow-mo" }, { "ポーズメニュー", "Pause menu" }, { "四大遺物", "Divine Beasts" }, { "オープンワールド", "Open world" }, { "ビューワー", "Viewer" }, { "Cダンジョン", "Shrine" }, { "夜A", "Night A" }, { "夜B", "Night B" },
+            { "ゲルド高原乾燥", "Gerudo highland (dry)" }, { "ヘブラ氷雪", "Hebra (snow)" }, { "ゲルド砂漠 Lv1", "Gerudo desert Lv1" }, { "ゲルド砂漠 Lv2", "Gerudo desert Lv2" }, { "ゲルド高地氷雪", "Gerudo highland (snow)" }, { "ラネール山氷雪", "Lanayru mountain (snow)" }, { "オルディン気候 Lv0", "Eldin climate Lv0" }, { "オルディン気候 Lv1", "Eldin climate Lv1" },
+            { "オルディン気候 Lv2", "Eldin climate Lv2" }, { "オルディン気候 Lv3", "Eldin climate Lv3" }, { "ゲルド砂漠", "Gerudo desert" }, { "コログの森", "Korok Forest" }, { "最寄水タイプ", "Nearest water type" }, { "濃度:雷", "Density: thunder" },
+        };
+        static readonly Dictionary<string, string> Back = new Dictionary<string, string>(StringComparer.Ordinal);
+        static ELinkLang() { foreach (var kv in En) Back[kv.Key + "  (" + kv.Value + ")"] = kv.Key; }
+        public static string Show(string raw) { return raw != null && En.TryGetValue(raw, out string e) ? raw + "  (" + e + ")" : raw; }
+        public static string Raw(string shown)
+        {
+            if (shown == null) return "";
+            if (Back.TryGetValue(shown, out string raw)) return raw;          // the glossed item, selected verbatim
+            int p = shown.LastIndexOf('(');                                   // a hand-typed gloss with different spacing
+            if (p > 0) { string head = shown.Substring(0, p).Trim(); if (En.ContainsKey(head)) return head; }
+            return shown.Trim();
+        }
+        public static void Fill(ComboBox cb, IEnumerable<string> items)
+        { string keep = cb.Text; cb.Items.Clear(); foreach (var s in items) cb.Items.Add(Show(s)); cb.Text = keep; }
+    }
+
     // Edit a child's gating condition. The fields depend on the parent container type: Switch = a
     // property branch (or default case), Random / Random2 = a weight, Sequence = force-continue. The
     // value type is freely changeable, so one editor switches a branch between enum / number / bool.
@@ -2047,7 +2179,7 @@ namespace FirstPlugin
             {
                 ClientSize = new Size(W, 290);
                 Controls.Add(new Label { Text = "Watched property", Left = 14, Top = y + 3, Width = 100 });
-                string ws = string.IsNullOrEmpty(watchName) ? "(not set)" : watchName + (watchGlobal ? "   (global)" : "   (local)");
+                string ws = string.IsNullOrEmpty(watchName) ? "(not set)" : ELinkLang.Show(watchName) + (watchGlobal ? "   (global)" : "   (local)");
                 Controls.Add(new Label { Text = ws, Left = 116, Top = y + 3, Width = W - 130, ForeColor = Color.Gainsboro });
                 y += 28;
                 defaultBox = new CheckBox { Text = "Default case (always matches)", Left = 14, Top = y, Width = W - 28, Checked = !cur.Set };
@@ -2061,7 +2193,7 @@ namespace FirstPlugin
                 cmpBox.SelectedIndex = cur.Set ? Math.Min(cur.Compare, 5) : 0; cmpBox.SetBounds(116, y, W - 130, 23); Controls.Add(cmpBox); y += 32;
                 Controls.Add(new Label { Text = "Value", Left = 14, Top = y + 3, Width = 96 });
                 valueBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown }; valueBox.SetBounds(116, y, W - 130, 23);
-                valueBox.Text = cur.Set ? (cur.PropType == 0 ? cur.EnumName ?? "" : cur.Value.ToString()) : "0"; Controls.Add(valueBox); y += 28;
+                valueBox.Text = cur.Set ? (cur.PropType == 0 ? ELinkLang.Show(cur.EnumName ?? "") : cur.Value.ToString()) : "0"; Controls.Add(valueBox); y += 28;
                 valueHint = new Label { Left = 116, Top = y, Width = W - 130, Height = 16, ForeColor = Color.Gray }; Controls.Add(valueHint); y += 22;
                 EventHandler upd = (s, e) =>
                 {
@@ -2070,7 +2202,7 @@ namespace FirstPlugin
                     valueHint.Text = en ? ValueHelp[propBox.SelectedIndex] : "";
                     string keep = valueBox.Text;
                     valueBox.Items.Clear();
-                    if (enumValues != null && propBox.SelectedIndex == 0) valueBox.Items.AddRange(enumValues.ToArray());   // enum -> the file's known values
+                    if (enumValues != null && propBox.SelectedIndex == 0) foreach (var nm in enumValues) valueBox.Items.Add(ELinkLang.Show(nm));   // enum -> the file's known values
                     valueBox.Text = keep;
                 };
                 defaultBox.CheckedChanged += upd; propBox.SelectedIndexChanged += upd; upd(null, null);
@@ -2104,7 +2236,7 @@ namespace FirstPlugin
         public bool TryReadValue(out double value, out string enumName)
         {
             value = 0; enumName = null;
-            if (PropType == 0) { enumName = ValueText; return true; }
+            if (PropType == 0) { enumName = ELinkLang.Raw(ValueText); return true; }
             return double.TryParse(ValueText, out value);
         }
     }
@@ -2129,20 +2261,15 @@ namespace FirstPlugin
             Controls.Add(new Label { Text = "Property", Left = 12, Top = 66, Width = 70 });
             box.SetBounds(88, 63, 256, 23); Controls.Add(box);
             globalBox.Text = "Global property"; globalBox.SetBounds(88, 94, 200, 22); globalBox.Checked = cur == null || cur.IsGlobal; Controls.Add(globalBox);
-            globalBox.CheckedChanged += (s, e) => FillProps();
-            FillProps();
-            box.Text = cur != null ? cur.Name : "";
+            globalBox.CheckedChanged += (s, e) => { FillProps(); box.Enabled = globalBox.Checked; };
+            FillProps(); box.Enabled = globalBox.Checked;
+            box.Text = ELinkLang.Show(cur != null ? cur.Name : "");
             var ok = new Button { Text = "OK", DialogResult = DialogResult.OK }; ok.SetBounds(178, 130, 80, 26);
             var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel }; cancel.SetBounds(266, 130, 80, 26);
             Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
         }
-        void FillProps()
-        {
-            string keep = box.Text;
-            box.Items.Clear(); box.Items.AddRange((globalBox.Checked ? globalProps : localProps).ToArray());
-            box.Text = keep;
-        }
-        public string PropName { get { return box.Text.Trim(); } }
+        void FillProps() { ELinkLang.Fill(box, globalBox.Checked ? globalProps : localProps); }
+        public string PropName { get { return ELinkLang.Raw(box.Text); } }
         public bool IsGlobal { get { return globalBox.Checked; } }
     }
 
@@ -2259,7 +2386,7 @@ namespace FirstPlugin
         public ELinkAddTriggerDialog(List<KeyValuePair<int, string>> callList, ELinkTrigger existing, List<string> propertyNames)
         {
             calls = callList.Select(kv => kv.Key).ToArray();
-            propBox.Items.AddRange(propertyNames.ToArray());
+            foreach (var s in propertyNames) propBox.Items.Add(ELinkLang.Show(s));
             Text = existing == null ? "Add trigger" : "Edit trigger";
             FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent; const int W = 400; ClientSize = new Size(W, 290); int y = 12;
@@ -2282,7 +2409,7 @@ namespace FirstPlugin
             flagsL = new Label { Text = "Type", Left = 12, Top = y + 3, Width = 96 }; flagsBox.SetBounds(116, y, W - 128, 23); flagsBox.Items.AddRange(FlagNames); flagsBox.SelectedIndex = 0; Controls.Add(flagsL); Controls.Add(flagsBox); y += 36;
             if (existing != null)
             {
-                slotBox.Text = existing.Slot ?? ""; actionBox.Text = existing.Action ?? ""; propBox.Text = existing.Property ?? "";
+                slotBox.Text = existing.Slot ?? ""; actionBox.Text = existing.Action ?? ""; propBox.Text = ELinkLang.Show(existing.Property ?? "");
                 globalBox.Checked = existing.PropIsGlobal;
                 if (existing.Kind == "Action") { startBox.Text = existing.Start.ToString(); endBox.Text = existing.End == int.MaxValue ? "" : existing.End.ToString(); int fi = Array.IndexOf(FlagVals, existing.Flags); flagsBox.SelectedIndex = fi >= 0 ? fi : 0; }
             }
@@ -2304,7 +2431,7 @@ namespace FirstPlugin
         public int TargetCall { get { return targetBox.SelectedIndex >= 0 ? calls[targetBox.SelectedIndex] : -1; } }
         public string Slot { get { return slotBox.Text.Trim(); } }
         public string Action { get { return actionBox.Text.Trim(); } }
-        public string Property { get { return propBox.Text.Trim(); } }
+        public string Property { get { return ELinkLang.Raw(propBox.Text); } }
         public bool PropGlobal { get { return globalBox.Checked; } }
         public int Start { get { return int.TryParse(startBox.Text.Trim(), out int v) ? v : 0; } }
         public int End { get { return int.TryParse(endBox.Text.Trim(), out int v) ? v : int.MaxValue; } }
@@ -2402,7 +2529,8 @@ namespace FirstPlugin
                 + (c.RuntimeAssetName != null ? "\r\nPlays emitter set : " + c.RuntimeAssetName : "")
                 + (c.Condition != null ? "\r\nGated by : " + c.Condition : "");
             if (c.CallIndex < 0) { bag = null; grid.SelectedObject = null; RefreshPreview(); return; }
-            bag = new ELinkParamBag(elink.ReadAllParams(c.UserIndex, c.CallIndex), CommitParam, CommitFloat);
+            bag = new ELinkParamBag(elink.ReadAllParams(c.UserIndex, c.CallIndex), CommitParam, CommitFloat,
+                CommitCurve, elink.WatchPropertyNames(true), elink.WatchPropertyNames(false));
             currentCall.Overrides = elink.ReadOverrides(c.UserIndex, c.CallIndex);
             grid.SelectedObject = bag;
             RefreshPreview();
@@ -2432,6 +2560,14 @@ namespace FirstPlugin
         string CommitFloat(ELinkParamRow row, int mode, double value, double min, double max)
         {
             string err = elink.SetFloatParam(currentCall.UserIndex, currentCall.CallIndex, row.Bit, mode, value, min, max);
+            if (err.Length == 0) BeginInvoke((Action)ReloadFromBuffer);
+            return err;
+        }
+        // Commit a curve param: its driving property, type and points.
+        string CommitCurve(ELinkParamRow row, ELinkCurve curve)
+        {
+            string err = elink.SetCurveParam(currentCall.UserIndex, currentCall.CallIndex, row.Bit,
+                curve.Type, curve.Property, curve.IsGlobal, curve.LocalIndex, curve.Points.ToArray());
             if (err.Length == 0) BeginInvoke((Action)ReloadFromBuffer);
             return err;
         }
@@ -2553,8 +2689,12 @@ namespace FirstPlugin
         readonly List<ELinkParamRow> _rows;
         readonly Func<ELinkParamRow, string, string> _commit;
         readonly Func<ELinkParamRow, int, double, double, double, string> _commitFloat;
-        public ELinkParamBag(List<ELinkParamRow> rows, Func<ELinkParamRow, string, string> commit, Func<ELinkParamRow, int, double, double, double, string> commitFloat)
-        { _rows = rows; _commit = commit; _commitFloat = commitFloat; }
+        readonly Func<ELinkParamRow, ELinkCurve, string> _commitCurve;
+        public readonly List<string> GlobalProps, LocalProps;
+        public ELinkParamBag(List<ELinkParamRow> rows, Func<ELinkParamRow, string, string> commit, Func<ELinkParamRow, int, double, double, double, string> commitFloat,
+            Func<ELinkParamRow, ELinkCurve, string> commitCurve, List<string> globalProps, List<string> localProps)
+        { _rows = rows; _commit = commit; _commitFloat = commitFloat; _commitCurve = commitCurve; GlobalProps = globalProps; LocalProps = localProps; }
+        public string CommitCurve(ELinkParamRow row, ELinkCurve curve) { return _commitCurve(row, curve); }
         public void Reload(List<ELinkParamRow> rows) { _rows.Clear(); _rows.AddRange(rows); }   // refresh in place (no new SelectedObject)
         public PropertyDescriptorCollection GetProperties(Attribute[] attributes) { return GetProperties(); }
         public PropertyDescriptorCollection GetProperties()
@@ -2600,6 +2740,12 @@ namespace FirstPlugin
         public override bool CanResetValue(object component) { return Row.IsSet; }   // Reset = remove the override
         public override void ResetValue(object component) { _commit(Row, ""); }
         public override bool ShouldSerializeValue(object component) { return Row.IsSet; }   // bold = overridden
+        // A curve override opens the curve editor (the "..." button); other rows edit as text.
+        public override object GetEditor(Type editorBaseType)
+        {
+            if (Row.Mode == 3 && editorBaseType == typeof(System.Drawing.Design.UITypeEditor)) return new ELinkCurveEditor();
+            return base.GetEditor(editorBaseType);
+        }
         public override string Description
         {
             get
@@ -2609,6 +2755,89 @@ namespace FirstPlugin
                 if (!Row.Editable) t += " read-only";
                 return t + ".  Blank = not overridden.";
             }
+        }
+    }
+
+    // The "..." editor on a curve override row: opens the curve dialog and commits the result.
+    public class ELinkCurveEditor : System.Drawing.Design.UITypeEditor
+    {
+        public override System.Drawing.Design.UITypeEditorEditStyle GetEditStyle(ITypeDescriptorContext context)
+        { return System.Drawing.Design.UITypeEditorEditStyle.Modal; }
+        public override object EditValue(ITypeDescriptorContext context, IServiceProvider provider, object value)
+        {
+            var bag = context != null ? context.Instance as ELinkParamBag : null;
+            var desc = context != null ? context.PropertyDescriptor as ELinkParamDescriptor : null;
+            if (bag == null || desc == null || desc.Row.Curve == null) return value;
+            using (var dlg = new ELinkCurveDialog(desc.Row.Curve, bag.GlobalProps, bag.LocalProps))
+                if (dlg.ShowDialog() == DialogResult.OK)
+                {
+                    string err = bag.CommitCurve(desc.Row, dlg.Result);
+                    if (!string.IsNullOrEmpty(err)) MessageBox.Show(err, "ELink");
+                }
+            return value;
+        }
+    }
+
+    // Edit a curve override: the driving property, the curve type, and the (x, y) points. Points can be
+    // added anywhere (Add appends; Insert above / below adds next to the selected row).
+    class ELinkCurveDialog : Form
+    {
+        readonly ComboBox propBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown };
+        readonly CheckBox globalBox = new CheckBox { Text = "Global property" };
+        readonly ComboBox typeBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        readonly DataGridView grid = new DataGridView();
+        readonly List<string> globalProps, localProps;
+        readonly int localIndex;
+        public ELinkCurve Result;
+        public ELinkCurveDialog(ELinkCurve cur, List<string> globalProps, List<string> localProps)
+        {
+            this.globalProps = globalProps; this.localProps = localProps; localIndex = cur.LocalIndex;
+            Text = "Edit curve"; StartPosition = FormStartPosition.CenterParent; FormBorderStyle = FormBorderStyle.Sizable;
+            ClientSize = new Size(460, 460); MinimumSize = new Size(420, 380);
+            int W = ClientSize.Width, H = ClientSize.Height;
+            Controls.Add(new Label { Left = 12, Top = 8, Width = W - 24, Height = 32, AutoSize = false, ForeColor = Color.Gray,
+                Text = "The value follows these points as the property changes: X = the property value, Y = the override value." });
+            Controls.Add(new Label { Text = "Property", Left = 12, Top = 50, Width = 56 });
+            propBox.SetBounds(72, 47, 256, 23); Controls.Add(propBox);
+            globalBox.SetBounds(336, 48, 110, 22); globalBox.Checked = cur.IsGlobal; Controls.Add(globalBox);
+            Controls.Add(new Label { Text = "Type", Left = 12, Top = 80, Width = 56 });
+            typeBox.SetBounds(72, 77, 170, 23); typeBox.Items.AddRange(new[] { "Standard (linear)", "Constant" }); typeBox.SelectedIndex = cur.Type == 1 ? 1 : 0; Controls.Add(typeBox);
+            var add = new Button { Text = "Add" }; add.SetBounds(12, 110, 86, 26);
+            var insA = new Button { Text = "Insert above" }; insA.SetBounds(102, 110, 100, 26);
+            var insB = new Button { Text = "Insert below" }; insB.SetBounds(206, 110, 100, 26);
+            var rem = new Button { Text = "Remove" }; rem.SetBounds(310, 110, 86, 26);
+            add.Click += (s, e) => grid.Rows.Add(0f, 0f);
+            insA.Click += (s, e) => grid.Rows.Insert(grid.CurrentRow != null ? grid.CurrentRow.Index : 0, 0f, 0f);
+            insB.Click += (s, e) => grid.Rows.Insert(grid.CurrentRow != null ? grid.CurrentRow.Index + 1 : grid.Rows.Count, 0f, 0f);
+            rem.Click += (s, e) => { if (grid.CurrentRow != null && grid.Rows.Count > 1) grid.Rows.RemoveAt(grid.CurrentRow.Index); };
+            Controls.AddRange(new Control[] { add, insA, insB, rem });
+            grid.SetBounds(12, 146, W - 24, H - 146 - 50); grid.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            grid.AllowUserToAddRows = false; grid.RowHeadersVisible = false; grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            grid.Columns.Add("X", "X (property)"); grid.Columns.Add("Y", "Y (value)");
+            foreach (var p in cur.Points) grid.Rows.Add(p.X, p.Y);
+            Controls.Add(grid);
+            var save = new Button { Text = "Save", Anchor = AnchorStyles.Bottom | AnchorStyles.Right }; save.SetBounds(W - 196, H - 38, 88, 28);
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Anchor = AnchorStyles.Bottom | AnchorStyles.Right }; cancel.SetBounds(W - 100, H - 38, 88, 28);
+            save.Click += (s, e) => { if (BuildResult()) DialogResult = DialogResult.OK; };
+            Controls.Add(save); Controls.Add(cancel);
+            globalBox.CheckedChanged += (s, e) => { FillProps(); propBox.Enabled = globalBox.Checked; };
+            FillProps(); propBox.Enabled = globalBox.Checked; propBox.Text = ELinkLang.Show(cur.Property ?? "");
+            AcceptButton = save; CancelButton = cancel;
+        }
+        void FillProps() { ELinkLang.Fill(propBox, globalBox.Checked ? globalProps : localProps); }
+        bool BuildResult()
+        {
+            var pts = new List<PointF>();
+            foreach (DataGridViewRow row in grid.Rows)
+            {
+                if (row.IsNewRow) continue;
+                if (!float.TryParse(Convert.ToString(row.Cells[0].Value), out float x) || !float.TryParse(Convert.ToString(row.Cells[1].Value), out float y))
+                { MessageBox.Show("Each point needs a numeric X and Y.", "ELink"); return false; }
+                pts.Add(new PointF(x, y));
+            }
+            if (pts.Count < 1) { MessageBox.Show("A curve needs at least one point.", "ELink"); return false; }
+            Result = new ELinkCurve { Type = typeBox.SelectedIndex == 1 ? 1 : 0, Property = ELinkLang.Raw(propBox.Text), IsGlobal = globalBox.Checked, LocalIndex = localIndex, Points = pts };
+            return true;
         }
     }
 
