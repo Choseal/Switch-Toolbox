@@ -20,6 +20,9 @@ namespace Updater
         static string folderDir = "";
         static bool foundRelease = false;
 
+        const string RepoOwner = "Choseal";
+        const string RepoName = "Switch-Toolbox";
+
         static void Main(string[] args)
         {
             Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
@@ -200,7 +203,7 @@ namespace Updater
         static async Task GetReleases(GitHubClient client)
         {
             List<Release> Releases = new List<Release>();
-            foreach (Release r in await client.Repository.Release.GetAll("KillzXGaming", "Switch-Toolbox"))
+            foreach (Release r in await client.Repository.Release.GetAll(RepoOwner, RepoName))
                 Releases.Add(r);
             releases = Releases.ToArray();
         }

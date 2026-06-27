@@ -357,3 +357,8 @@ yuzu-glsl-decompiler
 AnimSetupPrevious.zip
 AnimSetupNew.zip
 Switch_Toolbox_Library/Forms/Editors/UV/UVEditor.cs
+
+# Release packaging output and local release tooling
+/dist/
+package-release.ps1
+RELEASING.md

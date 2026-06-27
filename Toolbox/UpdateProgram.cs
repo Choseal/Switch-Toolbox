@@ -21,6 +21,9 @@ namespace Toolbox
         public static List<GitHubCommit> CommitList = new List<GitHubCommit>();
         public static DateTime LatestReleaseTime;
 
+        public const string RepoOwner = "Choseal";
+        public const string RepoName = "Switch-Toolbox";
+
 
         public static void CheckLatest()
         {
@@ -43,7 +46,9 @@ namespace Toolbox
                 var version = string.Concat(asssemblyVersion.ToString().Reverse().Skip(2).Reverse());
 
                 var lastestRelease = Releases.FirstOrDefault();
-                if (lastestRelease != null && lastestRelease.Assets[0].UpdatedAt.ToString() == versionCheck.CompileDate)
+                if (lastestRelease != null &&
+                    (lastestRelease.Assets[0].UpdatedAt.ToString() == versionCheck.CompileDate ||
+                     (!string.IsNullOrEmpty(versionCheck.ProgramVersion) && lastestRelease.TagName == versionCheck.ProgramVersion)))
                 {
                     Runtime.ProgramVersion = lastestRelease.TagName;
                     Runtime.CompileDate = lastestRelease.Assets[0].UpdatedAt.ToString();
@@ -112,7 +117,7 @@ namespace Toolbox
             DateTimeOffset CurrentRelease;
             bool IsValidTime = DateTimeOffset.TryParse(Runtime.CompileDate, out CurrentRelease);
 
-            foreach (GitHubCommit c in await client.Repository.Commit.GetAll("KillzXGaming", "Switch-Toolbox", options))
+            foreach (GitHubCommit c in await client.Repository.Commit.GetAll(RepoOwner, RepoName, options))
             {
                 if (IsValidTime)
                 {
@@ -132,7 +137,7 @@ namespace Toolbox
         static async Task GetReleases(GitHubClient client)
         {
             Releases = new List<Release>();
-            foreach (Release r in await client.Repository.Release.GetAll("KillzXGaming", "Switch-Toolbox"))
+            foreach (Release r in await client.Repository.Release.GetAll(RepoOwner, RepoName))
                 Releases.Add(r);
         }
     }
