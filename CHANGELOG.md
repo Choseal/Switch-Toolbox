@@ -1,5 +1,31 @@
 # BotW EFT Renderer Changelog
 
+## v9: ELink2 trigger and condition editing, and Switch/Random/Sequence groups (2026-06-27)
+
+### Added
+- **Edit the conditions that gate an effect.** Right-click a group child for *Edit condition*: a Switch child
+  takes a property branch (value type, comparison and value, or a default case), a Random child takes a weight,
+  and a Sequence child takes force-continue. The dialog shows the group's watched property and adapts its fields
+  to the group type.
+- **Edit a Switch group's watched property** (*Edit watch property*), as a global game property or, for an
+  existing local watch, keeping its local property. The property name and a global/local explanation are shown.
+- **Edit triggers** (*Edit triggers* on an actor): list, add, edit and remove the triggers that fire its effects.
+  A trigger is an Action (animation slot and action, with a frame range and type), a Property (a watched property
+  with an optional gating condition) or an Always (unconditional) trigger, and Edit can change one kind into another.
+- **Create Switch, Random, Random (no repeat) and Sequence groups**, not just Blend. The create dialog picks the
+  group type; Random children get a default weight, and a Switch's watch property and child conditions are set
+  afterward.
+- Conditions live in a shared table, so editing one child's condition gives it a private record (reusing an
+  identical one when present, otherwise appended at the table end), leaving every other user of the original
+  untouched. The same applies to a property trigger's gating condition.
+- The watch property, condition value and trigger property fields are editable dropdowns listing the names and
+  values the file already uses, with a Switch branch's value list filtered to its watched property. Common
+  values are one selection away, and a new name or value can still be typed.
+
+### Changed
+- The effect-group create menu item is now *Add effect group* with a type picker and per-type help text, replacing
+  the Blend-only *Add effect group (Blend)*.
+
 ## v8: ELink2 actor editing: create, delete, duplicate and rename user entries (2026-06-27)
 
 ### Added
@@ -21,8 +47,6 @@
   with every edit re-parsing clean across all actors.
 
 ### Changed
-- Clearer effect-creation wording: the menu items are now *Add effect* and *Add effect group (Blend)*, and the create
-  dialog explains each option and labels its fields (Effect / Group name, First effect name, Emitter set).
 - `.sbelnk` (the Yaz0-compressed form) now appears in the Open dialog's supported-files filter.
 
 ### Upcoming features

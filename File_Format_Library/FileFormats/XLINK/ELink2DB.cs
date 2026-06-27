@@ -167,6 +167,46 @@ namespace FirstPlugin
         public List<string> TriggerLines = new List<string>();
     }
 
+    // A child's gating condition, decoded for the editor. ParentType picks the meaning: Switch 0 = a
+    // property branch (PropType/Compare/Value or a global enum name), Random 1 / Random2 2 = Weight,
+    // Sequence 4 = ForceContinue. Set = false means the child has no condition (a Switch default case).
+    public class ELinkCondition
+    {
+        public bool Set;
+        public int ParentType;
+        public int PropType;       // switch branch: 0 Enum, 1 S32, 2 F32, 3 Bool
+        public int Compare;        // 0 == , 1 > , 2 >= , 3 < , 4 <= , 5 !=
+        public bool IsGlobal;
+        public string EnumName;    // global enum branch
+        public double Value;       // S32 / F32 / Bool branch
+        public float Weight;       // random
+        public bool ForceContinue; // sequence
+    }
+
+    // A Switch container's watched property.
+    public class ELinkWatch
+    {
+        public bool IsSwitch;
+        public string Name;
+        public bool IsGlobal;
+        public int LocalIndex;
+    }
+
+    // One trigger that fires a call: an Action (animation slot + action name, frame range), a Property
+    // (watched property, optional gating condition) or an Always (unconditional) trigger.
+    public class ELinkTrigger
+    {
+        public string Kind;        // "Action", "Property", "Always"
+        public int Index;          // position within its kind's flat list
+        public string Event;       // slot/action names (Action) or property name (Property)
+        public string Slot, Action, Property;
+        public bool PropIsGlobal;
+        public string Target;
+        public int TargetCall;
+        public int Start, End, Flags;
+        public string Condition;   // property-trigger gating (display)
+    }
+
     // ---- parser (big-endian; port of elink_full.py) --------------------------------------------
     public class ELinkFile
     {
@@ -230,6 +270,7 @@ namespace FirstPlugin
         // structural edit grows the file and shifts the regions after the ResParam region.
         void Reindex()
         {
+            _vocab = null;                                          // property / enum vocabulary is rebuilt on demand
             uint[] h = new uint[17];
             for (int i = 0; i < 17; i++) h[i] = U32(4 + i * 4);
             Version = h[1]; NumResParam = h[2]; NumResAssetParam = h[3]; NumResTrig = h[4];
@@ -327,6 +368,7 @@ namespace FirstPlugin
         public bool Dirty;
         public byte[] Bytes { get { return D; } }
         void WU32(long p, uint v) { D[p] = (byte)(v >> 24); D[p + 1] = (byte)(v >> 16); D[p + 2] = (byte)(v >> 8); D[p + 3] = (byte)v; }
+        void WU16(long p, ushort v) { D[p] = (byte)(v >> 8); D[p + 1] = (byte)v; }
         static uint FloatBits(float f) { var b = BitConverter.GetBytes(f); return ((uint)b[3] << 24) | ((uint)b[2] << 16) | ((uint)b[1] << 8) | b[0]; }
         static int Popcount(ulong m) { int c = 0; while (m != 0) { c += (int)(m & 1); m >>= 1; } return c; }
 
@@ -1021,7 +1063,11 @@ namespace FirstPlugin
             var a = new byte[0x20];
             RW32(a, 0, nameOff); RW16(a, 6, 1); RW32(a, 8, 1); RW32(a, 0xC, 0xFFFFFFFF);
             RW32(a, 0x10, Crc32(name + "#g")); RW32(a, 0x14, Crc32(name)); RW32(a, 0x1C, 0xFFFFFFFF);
-            var rec = new byte[0xC]; RW32(rec, 0, (uint)ctype);   // Blend/Random/Sequence record (child range filled on layout)
+            byte[] rec;
+            if (ctype == 0)   // Switch: 0x18 tail (watch set later via the watch editor); child range filled on layout
+            { rec = new byte[0x18]; RW32(rec, 0xC, ResolveNameOffset("")); RW32(rec, 0x10, 0xFFFFFFFF); RW16(rec, 0x14, 0xFFFF); rec[0x16] = 1; }
+            else rec = new byte[0xC];
+            RW32(rec, 0, (uint)ctype);
             return new CallNode { Act = a, IsContainer = true, Rec = rec, Old = -1 };
         }
         byte[] NewAlwaysTrigger(string name, int newIdx)
@@ -1119,7 +1165,385 @@ namespace FirstPlugin
             RemapExistingTriggers(ub, o2n);
             if (parentCi < 0) ub.Always.Add(NewAlwaysTrigger(contName, cont.New));
             SpliceUser(ui, SerializeUser(ub, order)); Dirty = true;
-            newIndex = cont.New; return "";
+            newIndex = cont.New;
+            if (ctype == 1 || ctype == 2) SetWeightCondition(ui, leaf.New, ctype, 1.0f);   // Random children select by weight
+            return "";
+        }
+
+        // =====================================================================================
+        //  Condition + watch-property editing. The condition table is global and its records are
+        //  shared (one backs up to ~1200 children), so editing one child's condition gives it a
+        //  private record: reuse a byte-identical existing record, else append at the table end
+        //  (== NameTablePos) and grow the file. A child's condition is its ACT+0x1C offset; a
+        //  Switch container's watched property sits in the container record tail, edited in place.
+
+        static int CondSize(uint parentType) { return parentType == 0 ? 0x14 : 8; }   // Switch 0x14; Random/Random2/Sequence 8
+
+        IEnumerable<uint> ReferencedConditions()
+        {
+            var seen = new HashSet<uint>();
+            for (int ui = 0; ui < NumUser; ui++)
+            {
+                long ACT = ACTBase(ui, out int nCall);
+                for (int c = 0; c < nCall; c++) { uint co = U32(ACT + c * 0x20 + 0x1C); if (co != 0xFFFFFFFF && seen.Add(co)) yield return co; }
+                long b = UserOffsets[ui];
+                int nSlot = (int)U32(b + 0x14), nAction = (int)U32(b + 0x18), nAT = (int)U32(b + 0x1C), nProp = (int)U32(b + 0x20), nPT = (int)U32(b + 0x24);
+                long oPT = b + U32(b + 0x2C) + nSlot * 8 + nAction * 0xC + nAT * 0x18 + nProp * 0x10;
+                for (int t = 0; t < nPT; t++) { uint co = U32(oPT + t * 0x14 + 8); if (co != 0xFFFFFFFF && seen.Add(co)) yield return co; }
+            }
+        }
+        uint AppendCondition(byte[] rec)
+        {
+            long insAt = NameTablePos; uint newOff = (uint)(insAt - CondPos);
+            InsertBytes(insAt, rec);
+            WU32(4, U32(4) + (uint)rec.Length);          // FileSize
+            WU32(0x44, U32(0x44) + (uint)rec.Length);     // NameTablePos (the condition table grows into the gap before it)
+            Reindex();
+            return newOff;
+        }
+        uint ResolveCondition(byte[] rec)
+        {
+            foreach (uint co in ReferencedConditions())
+            {
+                if (CondSize(U32(CondPos + co)) != rec.Length) continue;
+                bool eq = true;
+                for (int k = 0; k < rec.Length; k++) if (D[CondPos + co + k] != rec[k]) { eq = false; break; }
+                if (eq) return co;
+            }
+            return AppendCondition(rec);
+        }
+        void SetChildCondOffset(int ui, int ci, uint off) { WU32(LocateACT(ui, ci) + 0x1C, off); Dirty = true; }
+
+        static byte[] SwitchCondBytes(uint propType, uint cmp, uint valueBits, short localEnumIdx, bool isGlobal)
+        { var r = new byte[0x14]; RW32(r, 4, propType); RW32(r, 8, cmp); RW32(r, 0xC, valueBits); RW16(r, 0x10, (ushort)localEnumIdx); r[0x13] = (byte)(isGlobal ? 1 : 0); return r; }
+        static byte[] WeightCondBytes(uint parentType, float weight)
+        { var r = new byte[8]; RW32(r, 0, parentType); RW32(r, 4, FloatBits(weight)); return r; }
+        static byte[] SequenceCondBytes(bool forceContinue)
+        { var r = new byte[8]; RW32(r, 0, 4); RW32(r, 4, forceContinue ? 1u : 0u); return r; }
+
+        // Make the child a Switch default case (no condition).
+        public string ClearChildCondition(int ui, int ci) { SetChildCondOffset(ui, ci, 0xFFFFFFFF); return ""; }
+        // Encode a Switch-branch compared value: propType 0 Enum (global name), 1 S32, 2 F32, 3 Bool. Returns
+        // an error string for an unsupported case, else null with the packed bits in `vbits`.
+        string SwitchValueBits(int propType, double value, string enumName, bool isGlobal, out uint vbits)
+        {
+            vbits = 0;
+            if (propType == 0)
+            {
+                if (!isGlobal) return "local enum conditions are not editable here";
+                vbits = ResolveNameOffset(enumName ?? "");
+            }
+            else if (propType == 2) vbits = FloatBits((float)value);
+            else if (propType == 3) vbits = value != 0 ? 1u : 0u;
+            else vbits = unchecked((uint)(int)Math.Round(value));
+            return null;
+        }
+        // Switch branch. isGlobal mirrors the parent switch's watched-property scope (the condition stores it
+        // alongside the compared value).
+        public string SetSwitchCondition(int ui, int ci, int propType, int cmp, double value, string enumName, bool isGlobal)
+        {
+            string err = SwitchValueBits(propType, value, enumName, isGlobal, out uint vbits);
+            if (err != null) return err;
+            SetChildCondOffset(ui, ci, ResolveCondition(SwitchCondBytes((uint)propType, (uint)cmp, vbits, -1, isGlobal)));
+            return "";
+        }
+        public string SetWeightCondition(int ui, int ci, int parentType, float weight)
+        { SetChildCondOffset(ui, ci, ResolveCondition(WeightCondBytes((uint)parentType, weight))); return ""; }
+        public string SetSequenceCondition(int ui, int ci, bool forceContinue)
+        { SetChildCondOffset(ui, ci, ResolveCondition(SequenceCondBytes(forceContinue))); return ""; }
+
+        ELinkCondition ReadConditionAt(uint co)
+        {
+            var r = new ELinkCondition();
+            if (co == 0xFFFFFFFF) return r;
+            long c = CondPos + co; r.Set = true; r.ParentType = (int)U32(c);
+            if (r.ParentType == 1 || r.ParentType == 2) { r.Weight = F32(c + 4); return r; }
+            if (r.ParentType == 4) { r.ForceContinue = U32(c + 4) != 0; return r; }
+            r.PropType = (int)U32(c + 4); r.Compare = (int)U32(c + 8); r.IsGlobal = U8(c + 0x13) != 0;
+            if (r.PropType == 0) r.EnumName = r.IsGlobal ? Name(U32(c + 0xC)) : null;
+            else if (r.PropType == 2 || r.PropType == 5) r.Value = F32(c + 0xC);
+            else if (r.PropType == 3) r.Value = U32(c + 0xC) != 0 ? 1 : 0;
+            else r.Value = (int)U32(c + 0xC);
+            return r;
+        }
+        public ELinkCondition ReadChildCondition(int ui, int ci) { return ReadConditionAt(U32(LocateACT(ui, ci) + 0x1C)); }
+
+        long ContainerRecPos(int ui, int ci)
+        {
+            long ACT = ACTBase(ui, out int nCall);
+            return ACT + nCall * 0x20 + U32(ACT + ci * 0x20 + 0x18);
+        }
+        public ELinkWatch ReadWatch(int ui, int ci)
+        {
+            var w = new ELinkWatch();
+            if ((U16(LocateACT(ui, ci) + 6) & 1) == 0) return w;
+            long rec = ContainerRecPos(ui, ci);
+            if (U32(rec) != 0) return w;
+            w.IsSwitch = true; uint n = U32(rec + 0xC); w.Name = n != 0 ? Name(n) : "";
+            w.LocalIndex = S16(rec + 0x14); w.IsGlobal = U8(rec + 0x16) != 0;
+            return w;
+        }
+        public string SetWatchProperty(int ui, int ci, string name, bool isGlobal, int localIndex)
+        {
+            if ((U16(LocateACT(ui, ci) + 6) & 1) == 0) return "not a container";
+            if (U32(ContainerRecPos(ui, ci)) != 0) return "watch property applies to Switch containers only";
+            if (!isGlobal && localIndex < 0) return "local watch properties are not editable here; keep Global checked";
+            uint nameOff = ResolveNameOffset(name ?? "");   // grows the name pool at EOF; the container record stays put
+            long rec = ContainerRecPos(ui, ci);
+            int idx = isGlobal ? -1 : localIndex;
+            WU32(rec + 0xC, nameOff); WU32(rec + 0x10, 0xFFFFFFFF);
+            D[rec + 0x14] = (byte)(idx >> 8); D[rec + 0x15] = (byte)idx;
+            D[rec + 0x16] = (byte)(isGlobal ? 1 : 0); D[rec + 0x17] = 0;
+            Dirty = true; return "";
+        }
+
+        // ---- editor vocabulary: the property names and enum values the file already uses, for dropdowns ----
+        // Local properties and enum values come from the file's own tables; global property names and the values
+        // compared against them are gathered from the Switch watches and conditions actually present.
+        class Vocab
+        {
+            public readonly HashSet<string> Global = new HashSet<string>(), Local = new HashSet<string>();
+            public readonly Dictionary<string, SortedSet<string>> Values = new Dictionary<string, SortedSet<string>>();
+            public readonly SortedSet<string> AllEnums = new SortedSet<string>(StringComparer.Ordinal);
+        }
+        Vocab _vocab;
+        Vocab GetVocab()
+        {
+            if (_vocab != null) return _vocab;
+            var v = new Vocab();
+            for (int i = 0; i < (int)NumLocProp; i++) v.Local.Add(Name(U32(LocPropPos + i * 4)));
+            long enumTbl = LocPropPos + NumLocProp * 4;
+            var localEnums = new string[NumLocEnum];
+            for (int i = 0; i < (int)NumLocEnum; i++) { localEnums[i] = Name(U32(enumTbl + i * 4)); v.AllEnums.Add(localEnums[i]); }
+            for (int ui = 0; ui < NumUser; ui++)
+            {
+                long ACT = ACTBase(ui, out int nCall);
+                long contStart = ACT + nCall * 0x20;
+                for (int i = 0; i < nCall; i++)
+                {
+                    long a = ACT + i * 0x20;
+                    if ((U16(a + 6) & 1) == 0) continue;
+                    long c = contStart + U32(a + 0x18);
+                    if (U32(c) != 0) continue;                          // Switch only
+                    uint wn = U32(c + 0xC); string wname = wn != 0 ? Name(wn) : "";
+                    if (wname.Length > 0) (U8(c + 0x16) != 0 ? v.Global : v.Local).Add(wname);
+                    for (int ch = I32(c + 4); ch <= I32(c + 8) && ch >= 0; ch++)
+                    {
+                        uint co = U32(ACT + ch * 0x20 + 0x1C);
+                        if (co == 0xFFFFFFFF) continue;
+                        long cc = CondPos + co;
+                        if (U32(cc) != 0 || U32(cc + 4) != 0) continue;  // Switch enum condition
+                        string val = U8(cc + 0x13) != 0 ? Name(U32(cc + 0xC))
+                                   : (S16(cc + 0x10) >= 0 && S16(cc + 0x10) < localEnums.Length ? localEnums[S16(cc + 0x10)] : null);
+                        if (val == null) continue;
+                        v.AllEnums.Add(val);
+                        if (wname.Length == 0) continue;
+                        if (!v.Values.TryGetValue(wname, out var s)) v.Values[wname] = s = new SortedSet<string>(StringComparer.Ordinal);
+                        s.Add(val);
+                    }
+                }
+                long b = UserOffsets[ui];
+                int nSlot = (int)U32(b + 0x14), nAction = (int)U32(b + 0x18), nAT = (int)U32(b + 0x1C), nProp = (int)U32(b + 0x20);
+                long oProp = b + U32(b + 0x2C) + nSlot * 8 + nAction * 0xC + nAT * 0x18;
+                for (int p = 0; p < nProp; p++) { long pp = oProp + p * 0x10; string pn = Name(U32(pp)); if (pn.Length > 0) (U32(pp + 4) != 0 ? v.Global : v.Local).Add(pn); }
+            }
+            return _vocab = v;
+        }
+        // Watched-property names the file uses: global game state, or this file's local properties.
+        public List<string> WatchPropertyNames(bool global)
+        { var l = new List<string>(global ? GetVocab().Global : GetVocab().Local); l.Sort(StringComparer.Ordinal); return l; }
+        // Enum values seen for `property`; falls back to every enum value the file uses when none are recorded for it.
+        public List<string> EnumValues(string property)
+        {
+            var v = GetVocab();
+            if (property != null && v.Values.TryGetValue(property, out var s) && s.Count > 0) return new List<string>(s);
+            return new List<string>(v.AllEnums);
+        }
+
+        // =====================================================================================
+        //  Trigger editing. A call fires from an Action trigger (animation slot + action name, a
+        //  frame range), a Property trigger (a watched property, an optional gating condition) or
+        //  an Always trigger (unconditional). Action-trigger frame ranges and flags are edited in
+        //  place; adding or removing a trigger rebuilds the trigger table through the same parse /
+        //  serialize path the node ops use. A property trigger is gated by a condition (its +0x08),
+        //  resolved through the same shared condition table as child conditions.
+
+        long ACTBase(int ui, out int nCall)
+        {
+            long b = UserOffsets[ui]; int nLocal = (int)U32(b + 4); nCall = (int)U32(b + 8);
+            return b + 0x30 + nLocal * 4 + NumUserParams * 4 + (((nCall * 2) + 3) & ~3);
+        }
+        public List<KeyValuePair<int, string>> CallList(int ui)
+        {
+            var list = new List<KeyValuePair<int, string>>();
+            long ACT = ACTBase(ui, out int nCall);
+            for (int i = 0; i < nCall; i++) list.Add(new KeyValuePair<int, string>(i, Name(U32(ACT + i * 0x20))));
+            return list;
+        }
+        public List<ELinkTrigger> ReadTriggerList(int ui)
+        {
+            var list = new List<ELinkTrigger>();
+            long ACT = ACTBase(ui, out int nCall);
+            long b = UserOffsets[ui];
+            int nSlot = (int)U32(b + 0x14), nAction = (int)U32(b + 0x18), nAT = (int)U32(b + 0x1C), nProp = (int)U32(b + 0x20), nPT = (int)U32(b + 0x24), nAlw = (int)U32(b + 0x28);
+            long oSlots = b + U32(b + 0x2C), oAct = oSlots + nSlot * 8, oAtrg = oAct + nAction * 0xC, oProp = oAtrg + nAT * 0x18, oPtrg = oProp + nProp * 0x10, oAlw = oPtrg + nPT * 0x14;
+            Func<uint, int> tgt = off => (int)(off / 0x20);
+            Func<int, string> callName = idx => idx >= 0 && idx < nCall ? Name(U32(ACT + idx * 0x20)) : "?";
+            for (int s = 0; s < nSlot; s++)
+            {
+                long sp = oSlots + s * 8; string slot = Name(U32(sp));
+                for (int act = S16(sp + 4); act <= S16(sp + 6) && act >= 0; act++)
+                {
+                    long ap = oAct + act * 0xC; string action = Name(U32(ap));
+                    for (int t = I32(ap + 4); t <= I32(ap + 8) && t >= 0; t++)
+                    {
+                        long tp = oAtrg + t * 0x18; int tc = tgt(U32(tp + 4));
+                        list.Add(new ELinkTrigger { Kind = "Action", Index = t, Slot = slot, Action = action, Event = slot + " / " + action,
+                            Target = callName(tc), TargetCall = tc, Start = I32(tp + 8), End = I32(tp + 0xC), Flags = U16(tp + 0x10) });
+                    }
+                }
+            }
+            for (int p = 0; p < nProp; p++)
+            {
+                long pp = oProp + p * 0x10; string prop = Name(U32(pp)); bool g = U32(pp + 4) != 0;
+                for (int t = I32(pp + 8); t <= I32(pp + 0xC) && t >= 0; t++)
+                {
+                    long tp = oPtrg + t * 0x14; int tc = tgt(U32(tp + 4)); uint co = U32(tp + 8);
+                    list.Add(new ELinkTrigger { Kind = "Property", Index = t, Property = prop, PropIsGlobal = g, Event = prop,
+                        Target = callName(tc), TargetCall = tc, Flags = U16(tp + 0xC), Condition = co != 0xFFFFFFFF ? DecodeCondition(co) : null });
+                }
+            }
+            for (int t = 0; t < nAlw; t++)
+            {
+                long tp = oAlw + t * 0x10; int tc = tgt(U32(tp + 4));
+                list.Add(new ELinkTrigger { Kind = "Always", Index = t, Event = "(always)", Target = callName(tc), TargetCall = tc, Flags = U16(tp + 8) });
+            }
+            return list;
+        }
+
+        long ActionTriggerPos(int ui, int atIndex)
+        {
+            long b = UserOffsets[ui];
+            int nSlot = (int)U32(b + 0x14), nAction = (int)U32(b + 0x18), nAT = (int)U32(b + 0x1C);
+            if (atIndex < 0 || atIndex >= nAT) return -1;
+            return b + U32(b + 0x2C) + nSlot * 8 + nAction * 0xC + atIndex * 0x18;
+        }
+        public string SetActionTriggerRange(int ui, int atIndex, int start, int end)
+        {
+            long tp = ActionTriggerPos(ui, atIndex); if (tp < 0) return "no such trigger";
+            WU32(tp + 8, (uint)start); WU32(tp + 0xC, (uint)end); Dirty = true; return "";
+        }
+        public string SetActionTriggerFlags(int ui, int atIndex, int flags)
+        {
+            long tp = ActionTriggerPos(ui, atIndex); if (tp < 0) return "no such trigger";
+            WU16(tp + 0x10, (ushort)flags); Dirty = true; return "";
+        }
+        long PropertyTriggerPos(int ui, int ptIndex)
+        {
+            long b = UserOffsets[ui];
+            int nSlot = (int)U32(b + 0x14), nAction = (int)U32(b + 0x18), nAT = (int)U32(b + 0x1C), nProp = (int)U32(b + 0x20), nPT = (int)U32(b + 0x24);
+            if (ptIndex < 0 || ptIndex >= nPT) return -1;
+            return b + U32(b + 0x2C) + nSlot * 8 + nAction * 0xC + nAT * 0x18 + nProp * 0x10 + ptIndex * 0x14;
+        }
+        // Gate a property trigger with a Switch-style condition (propType 0 Enum global / 1 S32 / 2 F32 / 3 Bool).
+        public string SetPropertyTriggerCondition(int ui, int ptIndex, int propType, int cmp, double value, string enumName, bool isGlobal)
+        {
+            long tp = PropertyTriggerPos(ui, ptIndex); if (tp < 0) return "no such trigger";
+            string err = SwitchValueBits(propType, value, enumName, isGlobal, out uint vbits);
+            if (err != null) return err;
+            uint off = ResolveCondition(SwitchCondBytes((uint)propType, (uint)cmp, vbits, -1, isGlobal));
+            tp = PropertyTriggerPos(ui, ptIndex);                       // re-locate after a possible append
+            WU32(tp + 8, off); Dirty = true; return "";
+        }
+        public string ClearPropertyTriggerCondition(int ui, int ptIndex)
+        {
+            long tp = PropertyTriggerPos(ui, ptIndex); if (tp < 0) return "no such trigger";
+            WU32(tp + 8, 0xFFFFFFFF); Dirty = true; return "";
+        }
+        public ELinkCondition ReadPropertyTriggerCondition(int ui, int ptIndex)
+        {
+            long tp = PropertyTriggerPos(ui, ptIndex);
+            return tp < 0 ? new ELinkCondition() : ReadConditionAt(U32(tp + 8));
+        }
+
+        byte[] NewSlotRec(string name) { var r = new byte[8]; RW32(r, 0, ResolveNameOffset(name)); return r; }
+        byte[] NewActionRec(string name) { var r = new byte[0xC]; RW32(r, 0, ResolveNameOffset(name)); return r; }
+        byte[] NewActionTrigger(string evt, int newIdx, int start, int end, int flags)
+        {
+            var t = new byte[0x18];
+            RW32(t, 0, Crc32(evt + "#at")); RW32(t, 4, (uint)(newIdx * 0x20)); RW32(t, 8, (uint)start); RW32(t, 0xC, (uint)end);
+            RW16(t, 0x10, (ushort)flags); RW16(t, 0x12, 0x4C8D); RW32(t, 0x14, 0xFFFFFFFF);
+            return t;
+        }
+        byte[] NewPropRec(string name, bool isGlobal) { var r = new byte[0x10]; RW32(r, 0, ResolveNameOffset(name)); RW32(r, 4, isGlobal ? 1u : 0u); return r; }
+        byte[] NewPropertyTrigger(string name, int newIdx)
+        {
+            var t = new byte[0x14];
+            RW32(t, 0, Crc32(name + "#pt")); RW32(t, 4, (uint)(newIdx * 0x20)); RW32(t, 8, 0xFFFFFFFF); RW16(t, 0xE, 0x4C8D); RW32(t, 0x10, 0xFFFFFFFF);
+            return t;
+        }
+
+        public string AddAlwaysTrigger(int ui, int ci)
+        {
+            var ub = ParseUser(ui);
+            if (ci < 0 || ci >= ub.All.Count) return "no such node";
+            var order = Layout(ub, out var o2n); RemapExistingTriggers(ub, o2n);
+            ub.Always.Add(NewAlwaysTrigger(Name(RU32(ub.All[ci].Act, 0)), o2n[ci]));
+            SpliceUser(ui, SerializeUser(ub, order)); Dirty = true; return "";
+        }
+        public string AddActionTrigger(int ui, int ci, string slotName, string actionName, int start, int end, int flags)
+        {
+            if (string.IsNullOrWhiteSpace(slotName) || string.IsNullOrWhiteSpace(actionName)) return "enter a slot and action name";
+            var ub = ParseUser(ui);
+            if (ci < 0 || ci >= ub.All.Count) return "no such node";
+            var order = Layout(ub, out var o2n); RemapExistingTriggers(ub, o2n);
+            int newIdx = o2n[ci];
+            var slot = ub.Slots.FirstOrDefault(s => Name(RU32(s.Rec, 0)) == slotName);
+            if (slot == null) { slot = new TrigSlot { Rec = NewSlotRec(slotName) }; ub.Slots.Add(slot); }
+            var action = slot.Actions.FirstOrDefault(act => Name(RU32(act.Rec, 0)) == actionName);
+            if (action == null) { action = new TrigAction { Rec = NewActionRec(actionName) }; slot.Actions.Add(action); }
+            action.Trigs.Add(NewActionTrigger(slotName + actionName, newIdx, start, end, flags));
+            SpliceUser(ui, SerializeUser(ub, order)); Dirty = true; return "";
+        }
+        public string AddPropertyTrigger(int ui, int ci, string propName, bool isGlobal)
+        {
+            if (string.IsNullOrWhiteSpace(propName)) return "enter a property name";
+            var ub = ParseUser(ui);
+            if (ci < 0 || ci >= ub.All.Count) return "no such node";
+            var order = Layout(ub, out var o2n); RemapExistingTriggers(ub, o2n);
+            int newIdx = o2n[ci];
+            var prop = ub.Props.FirstOrDefault(p => Name(RU32(p.Rec, 0)) == propName && (RU32(p.Rec, 4) != 0) == isGlobal);
+            if (prop == null) { prop = new TrigProp { Rec = NewPropRec(propName, isGlobal) }; ub.Props.Add(prop); }
+            prop.Trigs.Add(NewPropertyTrigger(propName, newIdx));
+            SpliceUser(ui, SerializeUser(ub, order)); Dirty = true; return "";
+        }
+        // Remove a trigger by kind ("Action", "Property", "Always") and its flat index; prunes an emptied action / slot / property.
+        public string RemoveTrigger(int ui, string kind, int index)
+        {
+            var ub = ParseUser(ui);
+            var order = Layout(ub, out var o2n); RemapExistingTriggers(ub, o2n);
+            if (kind == "Always")
+            {
+                if (index < 0 || index >= ub.Always.Count) return "no such trigger";
+                ub.Always.RemoveAt(index);
+            }
+            else if (kind == "Action")
+            {
+                bool done = false;   // index is the absolute action-trigger table subscript = the action's trigStart + position
+                foreach (var s in ub.Slots) { foreach (var act in s.Actions) { int ts = RI32(act.Rec, 4); for (int k = 0; k < act.Trigs.Count; k++) if (ts + k == index) { act.Trigs.RemoveAt(k); done = true; break; } if (done) break; } if (done) break; }
+                if (!done) return "no such trigger";
+                foreach (var s in ub.Slots) s.Actions.RemoveAll(act => act.Trigs.Count == 0);
+                ub.Slots.RemoveAll(s => s.Actions.Count == 0);
+            }
+            else if (kind == "Property")
+            {
+                bool done = false;   // index is the absolute property-trigger table subscript = the property's trigStart + position
+                foreach (var p in ub.Props) { int ts = RI32(p.Rec, 8); for (int k = 0; k < p.Trigs.Count; k++) if (ts + k == index) { p.Trigs.RemoveAt(k); done = true; break; } if (done) break; }
+                if (!done) return "no such trigger";
+                ub.Props.RemoveAll(p => p.Trigs.Count == 0);
+            }
+            else return "unknown trigger kind";
+            SpliceUser(ui, SerializeUser(ub, order)); Dirty = true; return "";
         }
 
         // =====================================================================================
@@ -1346,12 +1770,49 @@ namespace FirstPlugin
             return new ToolStripItem[]
             {
                 new ToolStripMenuItem("Add effect...", null, (s, e) => DoCreateLeaf(-1)),
-                new ToolStripMenuItem("Add effect group (Blend)...", null, (s, e) => DoCreateContainer(-1)),
+                new ToolStripMenuItem("Add effect group...", null, (s, e) => DoCreateContainer(-1)),
+                new ToolStripMenuItem("Edit triggers...", null, (s, e) => DoEditTriggers()),
                 new ToolStripSeparator(),
                 new ToolStripMenuItem("Duplicate actor...", null, (s, e) => DoDuplicateActor()),
                 new ToolStripMenuItem("Rename actor...", null, (s, e) => DoRenameActor()),
                 new ToolStripMenuItem("Delete actor", null, (s, e) => DoDeleteActor()),
             };
+        }
+        public void DoEditTriggers()
+        {
+            using (var dlg = new ELinkTriggerDialog(elink, Ui)) dlg.ShowDialog();
+            Rebuild();
+        }
+        public void DoEditCondition(int childCi, int parentCi, int parentType)
+        {
+            var watch = parentType == 0 ? elink.ReadWatch(Ui, parentCi) : null;
+            bool watchGlobal = watch == null || watch.IsGlobal;
+            var enumVals = watch != null ? elink.EnumValues(watch.Name) : null;
+            var cur = elink.ReadChildCondition(Ui, childCi);
+            using (var dlg = new ELinkConditionDialog(parentType, watch != null ? watch.Name : null, watchGlobal, enumVals, cur))
+            {
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+                string err;
+                if (parentType == 0)
+                {
+                    if (dlg.IsDefault) err = elink.ClearChildCondition(Ui, childCi);
+                    else
+                    {
+                        if (!dlg.TryReadValue(out double v, out string enumName)) { MessageBox.Show("Enter a numeric value.", "ELink"); return; }
+                        err = elink.SetSwitchCondition(Ui, childCi, dlg.PropType, dlg.Compare, v, enumName, dlg.WatchGlobal);
+                    }
+                }
+                else if (parentType == 4) err = elink.SetSequenceCondition(Ui, childCi, dlg.ForceContinue);
+                else if (parentType == 1 || parentType == 2) err = elink.SetWeightCondition(Ui, childCi, parentType, dlg.Weight);
+                else return;   // Blend children carry no condition
+                Done(err, childCi);
+            }
+        }
+        public void DoEditWatch(int ci)
+        {
+            var w = elink.ReadWatch(Ui, ci);
+            using (var dlg = new ELinkWatchDialog(w, elink.WatchPropertyNames(true), elink.WatchPropertyNames(false)))
+                if (dlg.ShowDialog() == DialogResult.OK) Done(elink.SetWatchProperty(Ui, ci, dlg.PropName, dlg.IsGlobal, w.LocalIndex), ci);
         }
         void DoDuplicateActor()
         {
@@ -1389,7 +1850,7 @@ namespace FirstPlugin
         public void DoCreateContainer(int parentCi)
         {
             using (var dlg = new ELinkCreateDialog(true))
-                if (dlg.ShowDialog() == DialogResult.OK) { int ci; Done(elink.CreateContainer(Ui, parentCi, 3, dlg.NodeName, dlg.ChildName, dlg.EmitterSet, out ci), ci); }
+                if (dlg.ShowDialog() == DialogResult.OK) { int ci; Done(elink.CreateContainer(Ui, parentCi, dlg.ContainerType, dlg.NodeName, dlg.ChildName, dlg.EmitterSet, out ci), ci); }
         }
         public void DoDelete(ELinkCall call)
         {
@@ -1458,13 +1919,19 @@ namespace FirstPlugin
             if (call.IsContainer)
             {
                 items.Add(new ToolStripMenuItem("Add effect...", null, (s, e) => owner.DoCreateLeaf(call.CallIndex)));
-                items.Add(new ToolStripMenuItem("Add effect group (Blend)...", null, (s, e) => owner.DoCreateContainer(call.CallIndex)));
+                items.Add(new ToolStripMenuItem("Add effect group...", null, (s, e) => owner.DoCreateContainer(call.CallIndex)));
+                if (call.ContainerType == 0)
+                    items.Add(new ToolStripMenuItem("Edit watch property...", null, (s, e) => owner.DoEditWatch(call.CallIndex)));
                 items.Add(new ToolStripSeparator());
             }
+            var parent = Parent as ELinkCallNode;
+            if (parent != null && parent.Call.IsContainer && parent.Call.ContainerType != 3)   // Blend children carry no condition
+                items.Add(new ToolStripMenuItem("Edit condition...", null, (s, e) => owner.DoEditCondition(call.CallIndex, parent.Call.CallIndex, parent.Call.ContainerType)));
             items.Add(new ToolStripMenuItem("Duplicate", null, (s, e) => owner.DoDuplicate(call)));
             items.Add(new ToolStripMenuItem("Delete", null, (s, e) => owner.DoDelete(call)));
             return items.ToArray();
         }
+        internal ELinkCall Call { get { return call; } }
         ELinkUserNode OwningUserNode()
         {
             TreeNode n = Parent;
@@ -1473,30 +1940,42 @@ namespace FirstPlugin
         }
     }
 
-    // Small dialog for creating a node: a call name (plus a child call name for a container) and the emitter set it
+    // Dialog for creating a node: a name (plus a group type and first-effect name for a group) and the emitter set it
     // plays, chosen from the sets in any open .sesetlist. The set box is editable so it still works with none open.
     class ELinkCreateDialog : Form
     {
         readonly TextBox nameBox = new TextBox();
         readonly TextBox childBox;
         readonly ComboBox setBox = new ComboBox();
+        readonly ComboBox typeBox;
+        readonly Label hint;
         readonly Button ok;
+        static readonly int[] CTypes = { 3, 0, 1, 2, 4 };
+        static readonly string[] TypeNames = { "Blend (play together)", "Switch (pick by property)", "Random (pick by weight)", "Random, no repeat", "Sequence" };
         public ELinkCreateDialog(bool container)
         {
-            Text = container ? "Add effect group (Blend)" : "Add effect";
+            Text = container ? "Add effect group" : "Add effect";
             FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
             const int W = 380;
-            ClientSize = new Size(W, container ? 214 : 166);
+            ClientSize = new Size(W, container ? 270 : 166);
 
-            var hint = new Label
+            hint = new Label
             {
-                Left = 12, Top = 10, Width = W - 24, AutoSize = false, Height = container ? 44 : 26, ForeColor = Color.Gray,
-                Text = container ? "A Blend group plays several effects together. This creates the group and its first effect."
-                                 : "Plays one emitter set.",
+                Left = 12, Top = 10, Width = W - 24, AutoSize = false, Height = container ? 52 : 26, ForeColor = Color.Gray,
+                Text = container ? "" : "Plays one emitter set.",
             };
             Controls.Add(hint);
             int y = hint.Bottom + 8;
+            if (container)
+            {
+                Controls.Add(new Label { Text = "Group type", Left = 12, Top = y + 3, Width = 110 });
+                typeBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+                typeBox.SetBounds(126, y, W - 138, 23); typeBox.Items.AddRange(TypeNames); typeBox.SelectedIndex = 0;
+                typeBox.SelectedIndexChanged += (s, e) => UpdateHint();
+                Controls.Add(typeBox); y += 34;
+                UpdateHint();
+            }
             Controls.Add(new Label { Text = container ? "Group name" : "Effect name", Left = 12, Top = y + 3, Width = 110 });
             nameBox.SetBounds(126, y, W - 138, 23); Controls.Add(nameBox); y += 34;
             if (container)
@@ -1517,9 +1996,319 @@ namespace FirstPlugin
             nameBox.TextChanged += v; setBox.TextChanged += v; if (childBox != null) childBox.TextChanged += v;
             v(null, null);
         }
+        void UpdateHint()
+        {
+            switch (ContainerType)
+            {
+                case 0: hint.Text = "Switch plays the child whose condition matches a watched property. Set the watch property and each child condition after creating it."; break;
+                case 1: hint.Text = "Random plays one child chosen by weight."; break;
+                case 2: hint.Text = "Random, no repeat plays one child by weight without repeating the previous pick."; break;
+                case 4: hint.Text = "Sequence plays the children in order. Experimental: BotW ships no Sequence groups."; break;
+                default: hint.Text = "Blend plays several effects together. This creates the group and its first effect."; break;
+            }
+        }
+        public int ContainerType { get { return typeBox != null ? CTypes[typeBox.SelectedIndex] : 3; } }
         public string NodeName { get { return nameBox.Text.Trim(); } }
         public string ChildName { get { return childBox != null ? childBox.Text.Trim() : ""; } }
         public string EmitterSet { get { return setBox.Text.Trim(); } }
+    }
+
+    // Edit a child's gating condition. The fields depend on the parent container type: Switch = a
+    // property branch (or default case), Random / Random2 = a weight, Sequence = force-continue. The
+    // value type is freely changeable, so one editor switches a branch between enum / number / bool.
+    class ELinkConditionDialog : Form
+    {
+        readonly bool watchGlobal;
+        readonly List<string> enumValues;
+        readonly CheckBox defaultBox, continueBox;
+        readonly ComboBox propBox, cmpBox, valueBox;
+        readonly NumericUpDown weightBox;
+        readonly Label valueHint;
+        static readonly string[] Props = { "Enum (named value)", "Integer", "Decimal", "Yes / No" };
+        static readonly string[] Cmps = { "equals", "greater than", "greater or equal", "less than", "less or equal", "not equal" };
+        static readonly string[] ValueHelp =
+        {
+            "Value: the watched-property value that makes this play (a name).",
+            "Value: a whole number to compare against.",
+            "Value: a number (decimals allowed) to compare against.",
+            "Value: 0 or 1 (false / true).",
+        };
+        public ELinkConditionDialog(int parentType, string watchName, bool watchGlobal, List<string> enumValues, ELinkCondition cur)
+        {
+            this.watchGlobal = watchGlobal; this.enumValues = enumValues;
+            Text = "Edit condition"; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent; const int W = 380; int y = 12;
+            var top = new Label { Left = 14, Top = y, Width = W - 28, Height = 44, ForeColor = Color.Gray };
+            top.Text = parentType == 0 ? "Plays when the watched property passes the test. Set Value type to match that property, then the comparison and the value to match."
+                     : parentType == 4 ? "Sequence groups play children in order."
+                     : "This child is picked at random; a higher weight makes it more likely.";
+            Controls.Add(top); y = top.Bottom + 4;
+            if (parentType == 0)
+            {
+                ClientSize = new Size(W, 290);
+                Controls.Add(new Label { Text = "Watched property", Left = 14, Top = y + 3, Width = 100 });
+                string ws = string.IsNullOrEmpty(watchName) ? "(not set)" : watchName + (watchGlobal ? "   (global)" : "   (local)");
+                Controls.Add(new Label { Text = ws, Left = 116, Top = y + 3, Width = W - 130, ForeColor = Color.Gainsboro });
+                y += 28;
+                defaultBox = new CheckBox { Text = "Default case (always matches)", Left = 14, Top = y, Width = W - 28, Checked = !cur.Set };
+                Controls.Add(defaultBox); y += 30;
+                Controls.Add(new Label { Text = "Value type", Left = 14, Top = y + 3, Width = 96 });
+                propBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList }; propBox.Items.AddRange(Props);
+                int pt = cur.Set ? cur.PropType : 2;                          // _04 / _05 alias S32 / F32
+                propBox.SelectedIndex = pt == 4 ? 1 : pt == 5 ? 2 : Math.Min(pt, 3); propBox.SetBounds(116, y, W - 130, 23); Controls.Add(propBox); y += 32;
+                Controls.Add(new Label { Text = "Compare", Left = 14, Top = y + 3, Width = 96 });
+                cmpBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList }; cmpBox.Items.AddRange(Cmps);
+                cmpBox.SelectedIndex = cur.Set ? Math.Min(cur.Compare, 5) : 0; cmpBox.SetBounds(116, y, W - 130, 23); Controls.Add(cmpBox); y += 32;
+                Controls.Add(new Label { Text = "Value", Left = 14, Top = y + 3, Width = 96 });
+                valueBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown }; valueBox.SetBounds(116, y, W - 130, 23);
+                valueBox.Text = cur.Set ? (cur.PropType == 0 ? cur.EnumName ?? "" : cur.Value.ToString()) : "0"; Controls.Add(valueBox); y += 28;
+                valueHint = new Label { Left = 116, Top = y, Width = W - 130, Height = 16, ForeColor = Color.Gray }; Controls.Add(valueHint); y += 22;
+                EventHandler upd = (s, e) =>
+                {
+                    bool en = !defaultBox.Checked;
+                    propBox.Enabled = cmpBox.Enabled = valueBox.Enabled = en;
+                    valueHint.Text = en ? ValueHelp[propBox.SelectedIndex] : "";
+                    string keep = valueBox.Text;
+                    valueBox.Items.Clear();
+                    if (enumValues != null && propBox.SelectedIndex == 0) valueBox.Items.AddRange(enumValues.ToArray());   // enum -> the file's known values
+                    valueBox.Text = keep;
+                };
+                defaultBox.CheckedChanged += upd; propBox.SelectedIndexChanged += upd; upd(null, null);
+            }
+            else if (parentType == 4)
+            {
+                ClientSize = new Size(W, y + 70);
+                continueBox = new CheckBox { Text = "Force continue (keep playing through fade-out)", Left = 14, Top = y, Width = W - 28, Checked = cur.Set && cur.ForceContinue };
+                Controls.Add(continueBox); y += 36;
+            }
+            else
+            {
+                ClientSize = new Size(W, y + 70);
+                Controls.Add(new Label { Text = "Weight", Left = 14, Top = y + 3, Width = 96 });
+                weightBox = new NumericUpDown { DecimalPlaces = 3, Minimum = 0, Maximum = 100000, Increment = 0.1M };
+                weightBox.SetBounds(116, y, 120, 23); weightBox.Value = (decimal)(cur.Set ? cur.Weight : 1.0f); Controls.Add(weightBox); y += 36;
+            }
+            int by = ClientSize.Height - 36;
+            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK }; ok.SetBounds(W - 178, by, 80, 26);
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel }; cancel.SetBounds(W - 90, by, 80, 26);
+            Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
+        }
+        public bool IsDefault { get { return defaultBox != null && defaultBox.Checked; } }
+        public int PropType { get { return propBox != null ? propBox.SelectedIndex : 0; } }
+        public int Compare { get { return cmpBox != null ? cmpBox.SelectedIndex : 0; } }
+        public string ValueText { get { return valueBox != null ? valueBox.Text.Trim() : ""; } }
+        public float Weight { get { return weightBox != null ? (float)weightBox.Value : 1f; } }
+        public bool ForceContinue { get { return continueBox != null && continueBox.Checked; } }
+        public bool WatchGlobal { get { return watchGlobal; } }
+        // Enum value is a name; the others are numeric. Returns false if a numeric type has a non-numeric value.
+        public bool TryReadValue(out double value, out string enumName)
+        {
+            value = 0; enumName = null;
+            if (PropType == 0) { enumName = ValueText; return true; }
+            return double.TryParse(ValueText, out value);
+        }
+    }
+
+    // Edit a Switch container's watched property. The property box lists the names the file already uses
+    // (global game state, or this actor's local properties) but stays editable so a new name can be typed.
+    class ELinkWatchDialog : Form
+    {
+        readonly ComboBox box = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown };
+        readonly CheckBox globalBox = new CheckBox();
+        readonly List<string> globalProps, localProps;
+        public ELinkWatchDialog(ELinkWatch cur, List<string> globalProps, List<string> localProps)
+        {
+            this.globalProps = globalProps; this.localProps = localProps;
+            Text = "Edit watch property"; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent; ClientSize = new Size(360, 172);
+            Controls.Add(new Label
+            {
+                Left = 12, Top = 10, Width = 336, Height = 46, ForeColor = Color.Gray,
+                Text = "The Switch plays the child whose condition matches this property. Global properties are shared across the game (speed, weather, time); local ones belong to this actor.",
+            });
+            Controls.Add(new Label { Text = "Property", Left = 12, Top = 66, Width = 70 });
+            box.SetBounds(88, 63, 256, 23); Controls.Add(box);
+            globalBox.Text = "Global property"; globalBox.SetBounds(88, 94, 200, 22); globalBox.Checked = cur == null || cur.IsGlobal; Controls.Add(globalBox);
+            globalBox.CheckedChanged += (s, e) => FillProps();
+            FillProps();
+            box.Text = cur != null ? cur.Name : "";
+            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK }; ok.SetBounds(178, 130, 80, 26);
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel }; cancel.SetBounds(266, 130, 80, 26);
+            Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
+        }
+        void FillProps()
+        {
+            string keep = box.Text;
+            box.Items.Clear(); box.Items.AddRange((globalBox.Checked ? globalProps : localProps).ToArray());
+            box.Text = keep;
+        }
+        public string PropName { get { return box.Text.Trim(); } }
+        public bool IsGlobal { get { return globalBox.Checked; } }
+    }
+
+    // Manage the triggers that fire an actor's effects: list them and add / edit / remove. Action
+    // triggers carry an animation slot + action name and a frame range; property triggers carry a
+    // watched property and an optional gating condition; always triggers fire unconditionally. Edit
+    // can change a trigger's kind (an always trigger becomes an action or property one and back).
+    class ELinkTriggerDialog : Form
+    {
+        readonly ELinkFile elink; readonly int ui;
+        readonly ListView list;
+        public ELinkTriggerDialog(ELinkFile e, int userIndex)
+        {
+            elink = e; ui = userIndex;
+            Text = "Edit triggers"; StartPosition = FormStartPosition.CenterParent; ClientSize = new Size(680, 360); MinimumSize = new Size(560, 280);
+            list = new ListView { Dock = DockStyle.Top, Height = 300, View = View.Details, FullRowSelect = true, MultiSelect = false };
+            list.Columns.Add("Kind", 70); list.Columns.Add("Event", 200); list.Columns.Add("Plays", 130);
+            list.Columns.Add("Frames", 110); list.Columns.Add("Flags", 50); list.Columns.Add("Condition", 140);
+            Controls.Add(list);
+            var bar = new Panel { Dock = DockStyle.Bottom, Height = 44 };
+            var add = new Button { Text = "Add...", Left = 10, Top = 8, Width = 78 };
+            var edit = new Button { Text = "Edit...", Left = 94, Top = 8, Width = 78 };
+            var cond = new Button { Text = "Condition...", Left = 178, Top = 8, Width = 90 };
+            var remove = new Button { Text = "Remove", Left = 274, Top = 8, Width = 78 };
+            var close = new Button { Text = "Close", Top = 8, Width = 78, Anchor = AnchorStyles.Top | AnchorStyles.Right, DialogResult = DialogResult.OK };
+            close.Left = ClientSize.Width - 88;
+            add.Click += (s, ev) => DoAdd(); edit.Click += (s, ev) => DoEdit(); cond.Click += (s, ev) => DoCondition(); remove.Click += (s, ev) => DoRemove();
+            bar.Controls.AddRange(new Control[] { add, edit, cond, remove, close });
+            Controls.Add(bar); AcceptButton = close;
+            RefreshList();
+        }
+        void RefreshList()
+        {
+            list.Items.Clear();
+            foreach (var t in elink.ReadTriggerList(ui))
+            {
+                var it = new ListViewItem(new[] { t.Kind, t.Event, t.Target,
+                    t.Kind == "Action" ? FramesText(t.Start, t.End) : "", t.Kind == "Always" ? "" : "0x" + t.Flags.ToString("X"),
+                    t.Condition ?? "" }) { Tag = t };
+                list.Items.Add(it);
+            }
+        }
+        static string FramesText(int start, int end) { return start + " .. " + (end == int.MaxValue ? "end" : end.ToString()); }
+        ELinkTrigger Selected() { return list.SelectedItems.Count > 0 ? (ELinkTrigger)list.SelectedItems[0].Tag : null; }
+        void Apply(string err) { if (!string.IsNullOrEmpty(err)) MessageBox.Show(err, "ELink"); else RefreshList(); }
+        string AddFrom(ELinkAddTriggerDialog dlg)
+        {
+            if (dlg.Kind == "Always") return elink.AddAlwaysTrigger(ui, dlg.TargetCall);
+            if (dlg.Kind == "Property") return elink.AddPropertyTrigger(ui, dlg.TargetCall, dlg.Property, dlg.PropGlobal);
+            return elink.AddActionTrigger(ui, dlg.TargetCall, dlg.Slot, dlg.Action, dlg.Start, dlg.End, dlg.Flags);
+        }
+        List<string> PropNames()
+        {
+            var p = elink.WatchPropertyNames(true); p.AddRange(elink.WatchPropertyNames(false)); return p;
+        }
+        void DoAdd()
+        {
+            using (var dlg = new ELinkAddTriggerDialog(elink.CallList(ui), null, PropNames()))
+                if (dlg.ShowDialog() == DialogResult.OK) Apply(AddFrom(dlg));
+        }
+        void DoEdit()
+        {
+            var t = Selected(); if (t == null) { MessageBox.Show("Select a trigger first.", "ELink"); return; }
+            using (var dlg = new ELinkAddTriggerDialog(elink.CallList(ui), t, PropNames()))
+            {
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+                if (dlg.Kind == "Action" && t.Kind == "Action" && dlg.TargetCall == t.TargetCall && dlg.Slot == t.Slot && dlg.Action == t.Action)
+                {
+                    string err = elink.SetActionTriggerRange(ui, t.Index, dlg.Start, dlg.End);   // same event, only frames / type changed
+                    if (string.IsNullOrEmpty(err)) err = elink.SetActionTriggerFlags(ui, t.Index, dlg.Flags);
+                    Apply(err);
+                }
+                else
+                {
+                    string err = elink.RemoveTrigger(ui, t.Kind, t.Index);                       // kind or event changed: replace it
+                    if (string.IsNullOrEmpty(err)) err = AddFrom(dlg);
+                    Apply(err);
+                }
+            }
+        }
+        void DoCondition()
+        {
+            var t = Selected(); if (t == null) { MessageBox.Show("Select a trigger first.", "ELink"); return; }
+            if (t.Kind != "Property") { MessageBox.Show("Only property triggers use a gating condition.", "ELink"); return; }
+            using (var dlg = new ELinkConditionDialog(0, t.Property, t.PropIsGlobal, elink.EnumValues(t.Property), elink.ReadPropertyTriggerCondition(ui, t.Index)))
+                if (dlg.ShowDialog() == DialogResult.OK)
+                {
+                    if (dlg.IsDefault) { Apply(elink.ClearPropertyTriggerCondition(ui, t.Index)); return; }
+                    if (!dlg.TryReadValue(out double v, out string en)) { MessageBox.Show("Enter a numeric value.", "ELink"); return; }
+                    Apply(elink.SetPropertyTriggerCondition(ui, t.Index, dlg.PropType, dlg.Compare, v, en, dlg.WatchGlobal));
+                }
+        }
+        void DoRemove()
+        {
+            var t = Selected(); if (t == null) { MessageBox.Show("Select a trigger first.", "ELink"); return; }
+            Apply(elink.RemoveTrigger(ui, t.Kind, t.Index));
+        }
+    }
+
+    // Add or edit a trigger: pick its kind, the effect it plays, and the kind-specific fields. Passing
+    // an existing trigger pre-fills the fields so the same dialog edits one and can change its kind.
+    class ELinkAddTriggerDialog : Form
+    {
+        readonly ComboBox kindBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        readonly ComboBox targetBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        readonly ComboBox propBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown };
+        readonly TextBox slotBox = new TextBox(), actionBox = new TextBox(), startBox = new TextBox(), endBox = new TextBox();
+        readonly ComboBox flagsBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        readonly CheckBox globalBox = new CheckBox { Text = "Global property", Checked = true };
+        readonly Label hint, slotL, actionL, propL, startL, endL, flagsL;
+        readonly int[] calls;
+        static readonly int[] FlagVals = { 0, 2, 3 };
+        static readonly string[] FlagNames = { "One-shot", "Always", "On leave" };
+        public ELinkAddTriggerDialog(List<KeyValuePair<int, string>> callList, ELinkTrigger existing, List<string> propertyNames)
+        {
+            calls = callList.Select(kv => kv.Key).ToArray();
+            propBox.Items.AddRange(propertyNames.ToArray());
+            Text = existing == null ? "Add trigger" : "Edit trigger";
+            FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent; const int W = 400; ClientSize = new Size(W, 290); int y = 12;
+            hint = new Label { Left = 12, Top = y, Width = W - 24, Height = 30, ForeColor = Color.Gray }; Controls.Add(hint); y = hint.Bottom + 4;
+            Controls.Add(new Label { Text = "Kind", Left = 12, Top = y + 3, Width = 96 });
+            kindBox.SetBounds(116, y, W - 128, 23); kindBox.Items.AddRange(new[] { "Action", "Property", "Always" });
+            kindBox.SelectedIndex = existing != null ? Math.Max(0, Array.IndexOf(new[] { "Action", "Property", "Always" }, existing.Kind)) : 0;
+            kindBox.SelectedIndexChanged += (s, e) => ApplyKind(); Controls.Add(kindBox); y += 32;
+            Controls.Add(new Label { Text = "Plays effect", Left = 12, Top = y + 3, Width = 96 });
+            foreach (var kv in callList) targetBox.Items.Add(kv.Value);
+            int ti = existing != null ? Array.IndexOf(calls, existing.TargetCall) : 0;
+            if (targetBox.Items.Count > 0) targetBox.SelectedIndex = ti >= 0 ? ti : 0;
+            targetBox.SetBounds(116, y, W - 128, 23); Controls.Add(targetBox); y += 34;
+            slotL = new Label { Text = "Animation slot", Left = 12, Top = y + 3, Width = 96 }; slotBox.SetBounds(116, y, W - 128, 23); Controls.Add(slotL); Controls.Add(slotBox);
+            propL = new Label { Text = "Watched property", Left = 12, Top = y + 3, Width = 100 }; propBox.SetBounds(116, y, W - 128, 23); Controls.Add(propL); Controls.Add(propBox); y += 32;
+            actionL = new Label { Text = "Animation action", Left = 12, Top = y + 3, Width = 100 }; actionBox.SetBounds(116, y, W - 128, 23); Controls.Add(actionL); Controls.Add(actionBox);
+            globalBox.SetBounds(116, y, 200, 22); Controls.Add(globalBox); y += 32;
+            startL = new Label { Text = "Start frame", Left = 12, Top = y + 3, Width = 96 }; startBox.SetBounds(116, y, 70, 23); startBox.Text = "0"; Controls.Add(startL); Controls.Add(startBox);
+            endL = new Label { Text = "End (blank = until end)", Left = 196, Top = y + 3, Width = 130 }; endBox.SetBounds(326, y, 60, 23); Controls.Add(endL); Controls.Add(endBox); y += 32;
+            flagsL = new Label { Text = "Type", Left = 12, Top = y + 3, Width = 96 }; flagsBox.SetBounds(116, y, W - 128, 23); flagsBox.Items.AddRange(FlagNames); flagsBox.SelectedIndex = 0; Controls.Add(flagsL); Controls.Add(flagsBox); y += 36;
+            if (existing != null)
+            {
+                slotBox.Text = existing.Slot ?? ""; actionBox.Text = existing.Action ?? ""; propBox.Text = existing.Property ?? "";
+                globalBox.Checked = existing.PropIsGlobal;
+                if (existing.Kind == "Action") { startBox.Text = existing.Start.ToString(); endBox.Text = existing.End == int.MaxValue ? "" : existing.End.ToString(); int fi = Array.IndexOf(FlagVals, existing.Flags); flagsBox.SelectedIndex = fi >= 0 ? fi : 0; }
+            }
+            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK }; ok.SetBounds(W - 178, ClientSize.Height - 36, 80, 26);
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel }; cancel.SetBounds(W - 90, ClientSize.Height - 36, 80, 26);
+            Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
+            ApplyKind();
+        }
+        void ApplyKind()
+        {
+            bool act = Kind == "Action", prop = Kind == "Property";
+            slotL.Visible = slotBox.Visible = actionL.Visible = actionBox.Visible = startL.Visible = startBox.Visible = endL.Visible = endBox.Visible = flagsL.Visible = flagsBox.Visible = act;
+            propL.Visible = propBox.Visible = globalBox.Visible = prop;
+            hint.Text = act ? "Fires when the actor's animation reaches this slot and action, during the frame range."
+                     : prop ? "Fires when a watched game property changes. Add a gating test with the Condition button."
+                            : "Fires unconditionally whenever this effect setup is active.";
+        }
+        public string Kind { get { return (string)kindBox.SelectedItem; } }
+        public int TargetCall { get { return targetBox.SelectedIndex >= 0 ? calls[targetBox.SelectedIndex] : -1; } }
+        public string Slot { get { return slotBox.Text.Trim(); } }
+        public string Action { get { return actionBox.Text.Trim(); } }
+        public string Property { get { return propBox.Text.Trim(); } }
+        public bool PropGlobal { get { return globalBox.Checked; } }
+        public int Start { get { return int.TryParse(startBox.Text.Trim(), out int v) ? v : 0; } }
+        public int End { get { return int.TryParse(endBox.Text.Trim(), out int v) ? v : int.MaxValue; } }
+        public int Flags { get { return FlagVals[flagsBox.SelectedIndex]; } }
     }
 
     // A one-field name prompt for adding or duplicating an actor; returns null on cancel.

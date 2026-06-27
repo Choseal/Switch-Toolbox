@@ -3261,7 +3261,7 @@ namespace FirstPlugin
                 [Category("1b. Scale Curve"), DisplayName("Key3 Y"), Description("@0x5E4")] public float Sk3Y { get { return e.GetFloatAt(0x5E4); } set { e.SetFloatAt(0x5E4, value); } }
                 [Category("1b. Scale Curve"), DisplayName("Key3 Time"), Description("@0x5EC")] public float Sk3T { get { return e.GetFloatAt(0x5EC); } set { e.SetFloatAt(0x5EC, value); } }
 
-                // ===== 2. EMISSION (verified offsets, this session) =====
+                // ===== 2. EMISSION =====
                 [Category("2. Emission"), DisplayName("Lifespan (frames)"), Description("ptclMaxLifespan @0x6F0. <=1 = one-shot/burst sentinel.")]
                 public float Lifespan { get { return e.GetFloatAt(0x6F0); } set { e.SetFloatAt(0x6F0, value); } }
                 [Category("2. Emission"), DisplayName("Emit Rate"), Description("emissionRate / count @0x6F4.")]
