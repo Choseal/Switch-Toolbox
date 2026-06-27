@@ -80,8 +80,8 @@ namespace FirstPlugin
         }
 
         //Reveal the emitter SET named setName in any loaded .sesetlist, for the ELink viewer's "open original
-        //emitter" link. An ELink RuntimeAssetName is the emitter-set name, byte-identical to the ESET node's Text
-        //(verified). Returns false when no open file holds it, so the caller can prompt to open the right file.
+        //emitter" link. An ELink RuntimeAssetName is the emitter-set name, byte-identical to the ESET node's Text.
+        //Returns false when no open file holds it, so the caller can prompt to open the right file.
         public static bool TrySelectEmitterSet(string setName)
         {
             if (string.IsNullOrEmpty(setName)) return false;
