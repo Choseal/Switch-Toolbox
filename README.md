@@ -8,10 +8,9 @@ the Wild*'s effect systems: the particle **emitter sets** (`.sesetlist` / EFTB) 
 The upstream project is archived. This fork keeps the base toolbox intact and adds BotW support on top of it.
 
 This fork's BotW additions were built tool-assisted with [Claude Code](https://www.anthropic.com/claude-code).
-The reverse-engineering, simulation and file-editing code were developed with AI assistance, and every byte-level
-finding was verified against the real game data (RenderDoc captures, the `nw::eft` and xlink2 layouts, and
-round-trip re-parsing) before it shipped. [`CHANGELOG.md`](CHANGELOG.md) records each offset, its meaning, and
-how it was confirmed.
+Every byte-level finding was verified against the real game data (RenderDoc captures, the `nw::eft` and xlink2
+layouts) and other open-source projects before it shipped. [`CHANGELOG.md`](CHANGELOG.md) records each offset,
+its meaning, and how it was confirmed.
 
 ## What this fork adds
 
@@ -19,12 +18,15 @@ BotW stores its visual effects (fire, smoke, sparks, water ripples, Guardian bea
 `.sesetlist` files, and it plays those sets *through* a second system, the ELink2 effect-link database, which
 triggers them and overrides their parameters at runtime. Stock Switch-Toolbox parses the surrounding PTCL
 container but cannot render or meaningfully edit either system. This fork makes both viewable, simulated and
-editable from the file's own bytes.
+editable.
 
 ### Effects: emitter sets (`.sesetlist` / EFTB)
 
 **Rendering.** Selecting an emitter renders it in real time, simulated on the CPU from decoded fields: lifespan,
 emit rate, two-stage emission velocity, dispersion cone, air resistance, volume shapes, and momentum randomization.
+
+Disclaimer: The render is a best-effort approximation of what the effect looks like by itself. It depends on extra
+information, such as 2 textures for the shaders and other values, that are inserted or changed at run-time.
 
 - Particle types: camera-facing billboard quads, PRIM mesh particles for rings, shockwaves and ripples, and
   connection and trail stripes drawn as tapered ribbons.
@@ -54,9 +56,9 @@ emit rate, two-stage emission velocity, dispersion cone, air resistance, volume 
 
 ### Effect links (ELink2 / `.belnk`)
 
-A viewer and editor for `Bootup.pack/ELink2/ELink2DB.belnk`, the effect-link database (xlink2, big-endian). The
-game does not play emitter sets directly; it plays them through ELink, which can override their parameters and
-gate them on runtime state. This fork exposes and edits that second data source alongside the `.sesetlist` editor.
+A viewer and editor for `Bootup.pack/ELink2/ELink2DB.belnk`, the effect-link database. The game does not play (all)
+emitter sets directly; it plays them through ELink, which can override their parameters and gate them on runtime 
+state. This fork exposes and edits that second data source alongside the `.sesetlist` editor.
 
 **Viewer.**
 
@@ -80,14 +82,12 @@ gate them on runtime state. This fork exposes and edits that second data source 
   Random / Sequence group conditions, with watched-property and value dropdowns drawn from the names the file
   already uses, glossed with English alongside the game's built-in Japanese names.
 
-Every ELink edit is prototyped and verified against the real file (each re-parses clean across all users) before
-it ships.
-
 ## The base tool
 
 Everything the original tool does still works. It edits and previews many Nintendo formats, including BFRES,
 BNTX, SARC, BYAML, AAMP, KCL, PTCL and EFC effects, BFLYT and audio. The
-[upstream README](https://github.com/KillzXGaming/Switch-Toolbox) has the full list and tutorials.
+[upstream README](https://github.com/KillzXGaming/Switch-Toolbox) has the full list and tutorials. Some minor
+improvements were made to fix data getting lost on-save/export (related to mipmaps amongst other things).
 
 ## Building
 
