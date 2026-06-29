@@ -1,6 +1,21 @@
 # BotW EFT Renderer Changelog
 
-## v10: ELink2 curve-driven override editing (2026-06-27)
+> Releases are versioned by git tag and `AssemblyInfo` (semver); the `vN` numbers below are a finer-grained dev log.
+> `v1.0.0` is the renderer (entries `v1`-`v5`). The ELink work is the `V2.0.x` line, starting at `V2.0.0` (entry `v6`).
+
+## V2.0.2: ELink2 actor names recovered from the file itself (2026-06-29)
+
+### Changed
+- **Actor names now resolve from the file, with no sidecar.** A user record stores only a CRC32 of its name, but
+  the same name strings live in the file's global name table (referenced there as asset keys and property names),
+  so the viewer recovers each name by hashing every name-table string and matching it against the stored user
+  hashes. This labels nearly every stock actor on load (1345 of 1348 in the retail file) with no external file;
+  the few with no string anywhere in the file stay as their raw hash.
+- **Added and renamed actor names persist inside the file.** Creating, duplicating or renaming an actor appends
+  its name to the name table (deduped), so it round-trips through save and reload by that same recovery path. The
+  old `<file>.names.txt` sidecar (read on load, written on save) is removed.
+
+## v10: ELink2 curve-driven override editing (2026-06-27)  [= V2.0.1]
 
 ### Added
 - **Edit curve-driven overrides.** A Float override whose value follows a curve (Scale, Alpha, EmissionRate,
@@ -91,7 +106,7 @@
   the real file, then the C# was exercised headlessly against the same file, with every edit re-parsing clean across
   all 1345 users.
 
-## v6: ELink2 effect-link viewer and editor (2026-06-26)
+## v6: ELink2 effect-link viewer and editor (2026-06-26)  [= V2.0.0]
 
 A viewer and editor for BotW's `Bootup.pack/ELink2/ELink2DB.belnk` (the effect-link database, xlink2
 big-endian version 0x1E). The game plays emitter sets through ELink, which can override their params and gate

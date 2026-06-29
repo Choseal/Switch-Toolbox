@@ -55,10 +55,10 @@ namespace FirstPlugin
             if (stream.CanSeek) stream.Position = 0;   // Identify leaves the stream mid-read; ToArray() copies from the current position
             Elink = new ELinkFile(stream.ToArray());
 
-            // Optional names sidecar: "<file>.names.txt", one user name per line. Each is hashed (CRC32) and
-            // matched against the file's stored user hashes; unmatched names are ignored. Absent -> users show as hashes.
-            if (!string.IsNullOrEmpty(FilePath) && System.IO.File.Exists(FilePath + ".names.txt"))
-                Elink.LoadNames(System.IO.File.ReadAllLines(FilePath + ".names.txt"));
+            // User names aren't stored with the user record (the runtime looks users up by CRC32). The same name
+            // strings live in the global name table, so we recover them from the file itself. Stock users resolve
+            // with no external file; names added in the editor are written into the pool to round-trip.
+            Elink.AutoResolveNames();
 
             RebuildUsers();
         }
@@ -102,18 +102,7 @@ namespace FirstPlugin
         public void Save(Stream stream)
         {
             var b = Elink.Bytes;            // STFileSaver re-compresses to .sbelnk on save
-            stream.Write(b, 0, b.Length);
-            if (Elink.NamesDirty && !string.IsNullOrEmpty(FilePath)) WriteNamesSidecar();
-        }
-        // The .belnk stores only a CRC32 of each actor name, so custom names (added or renamed actors) are written
-        // to a "<file>.names.txt" sidecar, merged non-destructively with any existing one. The viewer reads it on load.
-        void WriteNamesSidecar()
-        {
-            string path = FilePath + ".names.txt";
-            var lines = new List<string>(); var seen = new HashSet<string>();
-            try { if (System.IO.File.Exists(path)) foreach (var l in System.IO.File.ReadAllLines(path)) if (seen.Add(l)) lines.Add(l); } catch { }
-            foreach (var nm in Elink.AllNames) if (seen.Add(nm)) lines.Add(nm);
-            try { System.IO.File.WriteAllLines(path, lines); } catch { }
+            stream.Write(b, 0, b.Length);   // added/renamed actor names persist inside the file's own name table
         }
     }
 
@@ -303,18 +292,35 @@ namespace FirstPlugin
             CPT = CRV + NumCurve * 0x14;
         }
 
-        // ---- user-name labelling (optional) ----
-        public void LoadNames(IEnumerable<string> names)
+        // Walk the global name table, invoking action(start, end) for each null-terminated entry (end excludes the
+        // terminator). Shared by name recovery and ResolveNameOffset so the pool scan lives in one place.
+        void ForEachNamePoolEntry(Action<int, int> action)
+        {
+            int p = (int)NameTablePos;
+            while (p < D.Length)
+            {
+                int e = Array.IndexOf(D, (byte)0, p); if (e < 0) e = D.Length;
+                action(p, e);
+                p = e + 1;
+            }
+        }
+
+        // ---- user-name labelling ----
+        // The user record stores only a CRC32 of its name (the runtime lookup key), not the string. The name strings
+        // are in the global name table (referenced as asset keys and property names), so each name is recovered by
+        // hashing every name-table entry and matching it against the stored user hashes. This resolves nearly all
+        // stock users with no external file; the few with no in-file string stay as hashes. On a CRC32 collision the
+        // first matching entry wins, so a user could in theory take an unrelated string's name.
+        public void AutoResolveNames()
         {
             NameMap = new Dictionary<uint, string>();
             var have = new HashSet<uint>(UserHashes);
-            foreach (var raw in names)
+            ForEachNamePoolEntry((p, e) =>
             {
-                string n = (raw ?? "").Trim();
-                if (n.Length == 0) continue;
-                uint c = Crc32(n);
-                if (have.Contains(c)) NameMap[c] = n;
-            }
+                if (e <= p) return;
+                uint c = Crc32(D, p, e - p);   // hash the raw on-disk bytes, the form the game keyed names on
+                if (have.Contains(c) && !NameMap.ContainsKey(c)) NameMap[c] = Name((uint)(p - NameTablePos));
+            });
         }
         public string UserDisplay(int ui)
         {
@@ -325,19 +331,21 @@ namespace FirstPlugin
         }
 
         static uint[] _crcTab;
-        static uint Crc32(string s)
+        static void EnsureCrcTab()
         {
-            if (_crcTab == null)
-            {
-                _crcTab = new uint[256];
-                for (uint n = 0; n < 256; n++)
-                { uint c = n; for (int k = 0; k < 8; k++) c = ((c & 1) != 0) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1); _crcTab[n] = c; }
-            }
-            byte[] b = Encoding.UTF8.GetBytes(s);
+            if (_crcTab != null) return;
+            _crcTab = new uint[256];
+            for (uint n = 0; n < 256; n++)
+            { uint c = n; for (int k = 0; k < 8; k++) c = ((c & 1) != 0) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1); _crcTab[n] = c; }
+        }
+        static uint Crc32(byte[] b, int start, int len)
+        {
+            EnsureCrcTab();
             uint crc = 0xFFFFFFFF;
-            foreach (byte x in b) crc = _crcTab[(crc ^ x) & 0xFF] ^ (crc >> 8);
+            for (int i = 0; i < len; i++) crc = _crcTab[(crc ^ b[start + i]) & 0xFF] ^ (crc >> 8);
             return crc ^ 0xFFFFFFFF;
         }
+        static uint Crc32(string s) { byte[] b = Encoding.UTF8.GetBytes(s ?? ""); return Crc32(b, 0, b.Length); }
 
         // ---- value resolution ----
         string ResolveTyped(int defineType, uint reff)
@@ -703,18 +711,14 @@ namespace FirstPlugin
         uint ResolveNameOffset(string s)
         {
             byte[] want = Encoding.UTF8.GetBytes(s ?? "");
-            long p = NameTablePos;
-            while (p < D.Length)
+            int found = -1;
+            ForEachNamePoolEntry((p, e) =>
             {
-                int e = Array.IndexOf(D, (byte)0, (int)p); if (e < 0) e = D.Length;
-                if (e - p == want.Length)
-                {
-                    bool eq = true;
-                    for (int k = 0; k < want.Length; k++) if (D[p + k] != want[k]) { eq = false; break; }
-                    if (eq) return (uint)(p - NameTablePos);
-                }
-                p = e + 1;
-            }
+                if (found >= 0 || e - p != want.Length) return;
+                for (int k = 0; k < want.Length; k++) if (D[p + k] != want[k]) return;
+                found = p - (int)NameTablePos;
+            });
+            if (found >= 0) return (uint)found;
             uint off = (uint)(D.Length - NameTablePos);
             var add = new byte[want.Length + 1];
             Array.Copy(want, add, want.Length);              // trailing 0 already present
@@ -1655,10 +1659,15 @@ namespace FirstPlugin
             Array.Copy(D, (int)(spliceAt + removeLen), outb, q, after);
             return outb;
         }
-        void RememberName(uint hash, string name)   // so a freshly-added actor shows by name, not hash
-        { if (NameMap == null) NameMap = new Dictionary<uint, string>(); NameMap[hash] = name; NamesDirty = true; }
-        public bool NamesDirty;   // a custom actor name was added/renamed -> the names sidecar is persisted on save
-        public IEnumerable<string> AllNames { get { return NameMap != null ? NameMap.Values : Enumerable.Empty<string>(); } }
+        // A freshly added or renamed actor shows by name, not hash, and persists across reloads. The name string is
+        // appended to the global name table (deduped), so AutoResolveNames recovers it on the next load.
+        void RememberName(uint hash, string name)
+        {
+            if (NameMap == null) NameMap = new Dictionary<uint, string>();
+            NameMap[hash] = name;
+            ResolveNameOffset(name);   // put the string in the pool so the name round-trips through save/load
+            Dirty = true;
+        }
 
         public string DeleteUser(int ui)
         {
