@@ -1349,11 +1349,11 @@ namespace Toolbox
         }
 
         private void reportBugToolStripMenuItem_Click(object sender, EventArgs e) {
-            System.Diagnostics.Process.Start("https://github.com/KillzXGaming/Switch-Toolbox/issues");
+            System.Diagnostics.Process.Start("https://github.com/Choseal/Switch-Toolbox/issues");
         }
 
         private void requestFeatureToolStripMenuItem1_Click(object sender, EventArgs e) {
-            System.Diagnostics.Process.Start("https://github.com/KillzXGaming/Switch-Toolbox/issues");
+            System.Diagnostics.Process.Start("https://github.com/Choseal/Switch-Toolbox/issues");
         }
 
         private void tutorialToolStripMenuItem_Click(object sender, EventArgs e) {
